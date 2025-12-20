@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -17,6 +20,8 @@ var (
 	supervisordURL string
 	listenAddress  string
 	metricsPath    string
+	username       string
+	password       string
 	version        bool
 	appVersion     float32 = 0.1
 
@@ -43,9 +48,11 @@ var (
 )
 
 func init() {
-	flag.StringVar(&supervisordURL, "supervisord-url", "http://localhost:9001/RPC2", "Supervisord XML-RPC URL")
+	flag.StringVar(&supervisordURL, "supervisord-url", "http://localhost:9001/RPC2", "Supervisord XML-RPC URL (supports http:// and unix:// schemes)")
 	flag.StringVar(&listenAddress, "web.listen-address", ":9876", "Address to listen for HTTP requests")
 	flag.StringVar(&metricsPath, "web.telemetry-path", "/metrics", "Path under which to expose metrics")
+	flag.StringVar(&username, "username", "", "Username for Supervisord authentication")
+	flag.StringVar(&password, "password", "", "Password for Supervisord authentication")
 	flag.BoolVar(&version, "version", false, "Displays application version")
 
 	flag.Parse()
@@ -55,8 +62,73 @@ func init() {
 	prometheus.MustRegister(supervisordUp)
 }
 
+// createTransport creates an HTTP transport that supports both HTTP and Unix socket connections
+func createTransport(targetURL string) (http.RoundTripper, string, error) {
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse URL: %v", err)
+	}
+
+	if parsedURL.Scheme == "unix" {
+		// For Unix sockets, we need to use a custom transport
+		socketPath := parsedURL.Path
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, proto, addr string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		}
+		
+		// Apply authentication if credentials are provided
+		if username != "" && password != "" {
+			return &authenticatedTransport{
+				Transport: transport,
+				Username:  username,
+				Password:  password,
+			}, "http://localhost/RPC2", nil
+		}
+		
+		// Return a fake HTTP URL for the xmlrpc client, the transport will handle the actual connection
+		return transport, "http://localhost/RPC2", nil
+	}
+
+	// For HTTP/HTTPS, use default transport with authentication if provided
+	if username != "" && password != "" {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		return &authenticatedTransport{
+			Transport: transport,
+			Username:  username,
+			Password:  password,
+		}, targetURL, nil
+	}
+
+	return nil, targetURL, nil
+}
+
+// authenticatedTransport wraps http.RoundTripper to add Basic Authentication
+type authenticatedTransport struct {
+	Transport http.RoundTripper
+	Username  string
+	Password  string
+}
+
+func (t *authenticatedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Clone the request to avoid modifying the original
+	reqCopy := req.Clone(req.Context())
+	reqCopy.SetBasicAuth(t.Username, t.Password)
+	return t.Transport.RoundTrip(reqCopy)
+}
+
 func fetchSupervisorProcessInfo() {
-	client, err := xmlrpc.NewClient(supervisordURL, nil)
+	transport, clientURL, err := createTransport(supervisordURL)
+	if err != nil {
+		log.Printf("Error creating transport: %v", err)
+		supervisordUp.Set(0)
+		processesMetric.Reset()
+		supervisorProcessUptime.Reset()
+		return
+	}
+
+	client, err := xmlrpc.NewClient(clientURL, transport)
 	if err != nil {
 		log.Printf("Error creating Supervisor XML-RPC client: %v", err)
 		supervisordUp.Set(0)

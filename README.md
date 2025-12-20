@@ -20,6 +20,8 @@ The Supervisor Exporter is a simple Go application that collects process status 
 - Configurable via command line parameters.
 - Provides a simple HTTP server for Prometheus to scrape metrics.
 - Handles unreachable Supervisord XML-RPC endpoints gracefully.
+- Supports both HTTP and Unix socket connections to Supervisord.
+- Supports authentication with username and password.
 
 ## Getting Started
 
@@ -40,14 +42,31 @@ Follow these steps to enable the XML-RPC endpoint on Supervisord:
    ```
 2. **Configure the XML-RPC Server:**
 
-   Add the following lines to your Supervisord configuration file, if they are not already present, to configure the XML-RPC server:
+   Add the following lines to your Supervisord configuration file, if they are not already present, to configure the XML-RPC server.
+
+   **Option 1: TCP/HTTP Server (inet_http_server):**
    
    ```shell
    [inet_http_server]
    port = 127.0.0.1:9001
+   username = dummy
+   password = dummy
    ```
 
    * `port`: Specify the IP address and port where the XML-RPC server will listen. In the example above, it listens on 127.0.0.1:9001.
+   * `username` and `password`: Optional authentication credentials.
+
+   **Option 2: Unix Socket Server (unix_http_server):**
+   
+   ```shell
+   [unix_http_server]
+   file=/run/supervisord/supervisor.sock
+   username = dummy
+   password = dummy
+   ```
+
+   * `file`: Specify the path to the Unix socket file.
+   * `username` and `password`: Optional authentication credentials.
 
 3. **Save and Restart Supervisord:**
    Save the configuration file and then restart Supervisord to apply the changes:
@@ -93,15 +112,30 @@ By default, the exporter will listen on port 9876 and use the Supervisor XML-RPC
 
 The Supervisord Exporter can be configured using command line parameters. Here are the available parameters:
 
-* `-supervisord-url`: The URL of the Supervisord XML-RPC interface. Default is `http://localhost:9001/RPC2`
+* `-supervisord-url`: The URL of the Supervisord XML-RPC interface. Supports both HTTP and Unix socket schemes. Default is `http://localhost:9001/RPC2`
+  * HTTP example: `http://localhost:9001/RPC2`
+  * Unix socket example: `unix:///run/supervisord/supervisor.sock`
+* `-username`: Username for Supervisord authentication (optional)
+* `-password`: Password for Supervisord authentication (optional)
 * `-web.listen-address`: The address and port where the exporter will listen for HTTP requests. Default is `:9876`
 * `-web.telemetry-path`: Path under which to expose metrics. Default is `/metrics`
 * `-version`: Print the version information and exit.
 
-Example of custom configuration:
+Examples of custom configurations:
 
+**HTTP with authentication:**
 ```shell
-./supervisord_exporter -supervisord-url="http://example.com:9001/RPC2" -web.listen-address=":8080" -web.telemetry-path="/metrics"
+./supervisord_exporter -supervisord-url="http://example.com:9001/RPC2" -username="dummy" -password="dummy" -web.listen-address=":8080"
+```
+
+**Unix socket with authentication:**
+```shell
+./supervisord_exporter -supervisord-url="unix:///run/supervisord/supervisor.sock" -username="dummy" -password="dummy"
+```
+
+**Unix socket without authentication:**
+```shell
+./supervisord_exporter -supervisord-url="unix:///var/run/supervisor.sock"
 ```
 
 ### Prometheus Metrics
