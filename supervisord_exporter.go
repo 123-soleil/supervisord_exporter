@@ -178,8 +178,11 @@ func markDown() {
 	// outage has already cleared the list, every later failed scrape sees processes
 	// already nil and skips straight past, instead of re-logging this warning (and
 	// redundantly re-nil'ing an already-nil list) on every single scrape for the
-	// rest of the outage.
-	if processes != nil && !prev.lastSuccess.IsZero() && time.Since(prev.lastSuccess) > staleGracePeriod {
+	// rest of the outage. It also implies lastSuccess is set: processes only ever
+	// becomes non-nil via publishSnapshot's success path, which always pairs it
+	// with a fresh, non-zero lastSuccess in that same call — so there's no need
+	// to separately guard against a zero lastSuccess here.
+	if processes != nil && time.Since(prev.lastSuccess) > staleGracePeriod {
 		log.Printf("Warning: no successful Supervisord scrape in over %s (stale-grace-period); clearing previously reported process metrics", staleGracePeriod)
 		processes = nil
 	}
@@ -339,10 +342,16 @@ func fetchSupervisorProcessInfo() {
 
 		// Any case that isn't a clear "the new entry is more recent" replacement is
 		// logged here, whichever way the start times (or their absence) compare —
-		// so no combination of duplicate entries falls through silently.
-		if newOk && (!existingOk || newStartTime > existingStartTime) {
+		// the default case covers any combination the specific ones below don't,
+		// so no combination of duplicate entries ever falls through silently.
+		switch {
+		case newOk && (!existingOk || newStartTime > existingStartTime):
 			latestInfo[key] = data
-		} else {
+		case existingOk && newOk && newStartTime == existingStartTime:
+			log.Printf("Warning: duplicate process entries for %s/%s share the same start time; keeping the one already seen", name, group)
+		case !existingOk && !newOk:
+			log.Printf("Warning: duplicate process entries for %s/%s have no valid start time; keeping the one already seen", name, group)
+		default:
 			log.Printf("Warning: duplicate process entries for %s/%s; keeping the one already seen", name, group)
 		}
 	}
