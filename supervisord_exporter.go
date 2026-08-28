@@ -242,6 +242,9 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		if parsedURL.Host != "" {
 			return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", targetURL)
 		}
+		if parsedURL.Path == "" {
+			return nil, "", fmt.Errorf("invalid unix socket URL %q: missing socket path", targetURL)
+		}
 		// For Unix sockets, clone the default transport (for its tuned defaults —
 		// MaxIdleConns, IdleConnTimeout, etc.) and just override how it dials.
 		socketPath := parsedURL.Path
@@ -251,9 +254,16 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		}
 		// Return a fake HTTP URL for the xmlrpc client, the transport will handle the actual connection
 		clientURL = "http://localhost/RPC2"
-	} else {
+	} else if parsedURL.Scheme == "http" || parsedURL.Scheme == "https" {
 		// For HTTP/HTTPS, use a default transport clone
 		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
+	} else {
+		// Anything else — including a missing/misparsed scheme from a typo like
+		// "localhost:9001/RPC2" (no "http://"), which url.Parse would otherwise
+		// silently accept as scheme "localhost" — is rejected here rather than
+		// falling through to the HTTP path and only failing cryptically on the
+		// first scrape.
+		return nil, "", fmt.Errorf("invalid -supervisord-url %q: unsupported scheme %q (expected http, https, or unix)", targetURL, parsedURL.Scheme)
 	}
 
 	var transport http.RoundTripper = baseTransport
@@ -325,8 +335,15 @@ func fetchSupervisorProcessInfo() {
 	latestInfo := make(map[processKey]map[string]interface{})
 
 	for _, data := range result {
-		name, _ := data["name"].(string)
-		group, _ := data["group"].(string)
+		name, nameOk := data["name"].(string)
+		group, groupOk := data["group"].(string)
+		if !nameOk || !groupOk {
+			// Falling back to "" lets this entry still be processed instead of
+			// dropped outright, but it means two malformed entries missing the
+			// same field can collide onto the same processKey and silently lose
+			// one of them in the dedup below — log it so that's diagnosable.
+			log.Printf("Warning: Supervisord process entry has a missing/invalid name or group (name=%q group=%q); it may collide with another malformed entry", name, group)
+		}
 
 		key := processKey{name: name, group: group}
 
