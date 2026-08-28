@@ -31,7 +31,7 @@ var (
 	rpcTimeout       time.Duration
 	staleGracePeriod time.Duration
 	version          bool
-	appVersion       = "0.6"
+	appVersion       = "0.6.1"
 
 	// TLS/mTLS for the /metrics endpoint served to Prometheus. webTLSCertFile and
 	// webTLSKeyFile must be set together to enable HTTPS; webTLSClientCAFile
