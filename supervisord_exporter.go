@@ -30,14 +30,17 @@ var (
 	version        bool
 	appVersion     = "0.1"
 
-	// rpcTransport and rpcClient are built once at startup from the (static)
+	// rpcTransport and rpcClientURL are built once at startup from the (static)
 	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
-	// across scrapes: this avoids paying a fresh connection handshake and
-	// xmlrpc.Client setup on every scrape. rpc.Client (which xmlrpc.Client wraps)
-	// is safe to reuse for repeated sequential calls.
+	// across scrapes, so the underlying connection pool is shared instead of
+	// starting cold every scrape. The *xmlrpc.Client itself is deliberately
+	// rebuilt on every fetch (see fetchSupervisorProcessInfo): net/rpc.Client
+	// permanently shuts itself down after a single decode error from its
+	// underlying codec, and kolo/xmlrpc's reflective decoder can plausibly fail
+	// on a truncated or unexpected response — a long-lived, reused *xmlrpc.Client
+	// would then wedge the exporter (supervisord_up stuck at 0) until restart.
 	rpcTransport http.RoundTripper
 	rpcClientURL string
-	rpcClient    *xmlrpc.Client
 
 	// fetchGroup coalesces concurrent scrapes into a single in-flight fetch:
 	// instead of every scrape performing its own XML-RPC round trip (each taking
@@ -189,12 +192,12 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		if parsedURL.Host != "" {
 			return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", targetURL)
 		}
-		// For Unix sockets, we need to use a custom transport
+		// For Unix sockets, clone the default transport (for its tuned defaults —
+		// MaxIdleConns, IdleConnTimeout, etc.) and just override how it dials.
 		socketPath := parsedURL.Path
-		baseTransport = &http.Transport{
-			DialContext: func(ctx context.Context, proto, addr string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
-			},
+		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
+		baseTransport.DialContext = func(ctx context.Context, proto, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		}
 		// Return a fake HTTP URL for the xmlrpc client, the transport will handle the actual connection
 		clientURL = "http://localhost/RPC2"
@@ -253,8 +256,16 @@ func refreshMetrics() {
 }
 
 func fetchSupervisorProcessInfo() {
+	client, err := xmlrpc.NewClient(rpcClientURL, rpcTransport)
+	if err != nil {
+		log.Printf("Error creating Supervisor XML-RPC client: %v", err)
+		publishSnapshot(&snapshot{})
+		return
+	}
+	defer client.Close()
+
 	result := []map[string]interface{}{}
-	if err := rpcClient.Call("supervisor.getAllProcessInfo", nil, &result); err != nil {
+	if err := client.Call("supervisor.getAllProcessInfo", nil, &result); err != nil {
 		log.Printf("Error calling Supervisor XML-RPC method: %v", err)
 		publishSnapshot(&snapshot{})
 		return
@@ -309,7 +320,12 @@ func fetchSupervisorProcessInfo() {
 
 		if sample.running {
 			if startTimeOk {
-				sample.uptimeSeconds = float64(time.Now().Unix() - startTime)
+				uptime := time.Now().Unix() - startTime
+				if uptime < 0 {
+					log.Printf("Warning: process %s/%s has a start time in the future (clock skew?); clamping uptime to 0", name, group)
+					uptime = 0
+				}
+				sample.uptimeSeconds = float64(uptime)
 				sample.hasUptime = true
 			} else {
 				log.Printf("Warning: process %s/%s is RUNNING but has no valid start time; skipping uptime metric", name, group)
@@ -350,17 +366,11 @@ func main() {
 	}
 
 	// Built once and reused for every scrape; supervisordURL/username/password/rpcTimeout
-	// are fixed after flag parsing, so there's no reason to rebuild these per request.
+	// are fixed after flag parsing, so there's no reason to rebuild the transport per request.
 	var err error
 	rpcTransport, rpcClientURL, err = createTransport(supervisordURL)
 	if err != nil {
-		fmt.Printf("Error: %s\n", err)
-		os.Exit(1)
-	}
-	rpcClient, err = xmlrpc.NewClient(rpcClientURL, rpcTransport)
-	if err != nil {
-		fmt.Printf("Error creating Supervisor XML-RPC client: %s\n", err)
-		os.Exit(1)
+		log.Fatalf("Error creating transport: %v", err)
 	}
 
 	http.HandleFunc(metricsPath, metricsHandler)
@@ -372,9 +382,8 @@ func main() {
 		WriteTimeout:      rpcTimeout + 10*time.Second,
 	}
 
-	fmt.Printf("Listening on %s\n", listenAddress)
+	log.Printf("Listening on %s", listenAddress)
 	if err := server.ListenAndServe(); err != nil {
-		fmt.Printf("Error: %s\n", err)
-		os.Exit(1)
+		log.Fatalf("Error: %s", err)
 	}
 }
