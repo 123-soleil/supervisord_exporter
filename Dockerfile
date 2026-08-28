@@ -5,7 +5,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go test ./...
 RUN CGO_ENABLED=0 go build .
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates && \
     adduser -D -H -u 10001 exporter
 COPY --from=builder /app/supervisord_exporter /usr/bin/supervisord_exporter
