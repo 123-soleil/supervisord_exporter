@@ -87,6 +87,8 @@ Once you have configured and verified the XML-RPC endpoint on Supervisord, you c
 
 ### Installation
 
+Requires Go 1.24 or newer (matching the `go`/`toolchain` directives in `go.mod`). With an older Go installed and no network access for Go's automatic toolchain download, `go build` will fail.
+
 1. Clone the repository:
 
    ```shell
@@ -115,7 +117,7 @@ The Supervisord Exporter can be configured using command line parameters. Here a
 * `-supervisord-url`: The URL of the Supervisord XML-RPC interface. Supports both HTTP and Unix socket schemes. Default is `http://localhost:9001/RPC2`
   * HTTP example: `http://localhost:9001/RPC2`
   * Unix socket example: `unix:///run/supervisord/supervisor.sock`
-* `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list.
+* `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list. If only one of username/password is set, authentication is silently disabled entirely (a warning is logged) — Supervisord is then scraped unauthenticated rather than the exporter failing to start.
 * `-password`: Password for Supervisord authentication (optional). Prefer the `SUPERVISORD_PASSWORD` environment variable, since CLI flags are visible to other local users via the process list.
 * `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`
 * `-stale-grace-period`: How long to keep serving the last known process metrics (with `supervisord_up=0`) after Supervisord becomes unreachable, before clearing them as too stale to trust. Default is `1m`. This is only re-evaluated on each scrape, so set it well above your Prometheus `scrape_interval` — if it's shorter than (or close to) `scrape_interval`, the very first failed scrape may already exceed it and clear the metrics immediately, defeating the point. Set to `0` to disable the grace period (clear immediately on any failure).
@@ -157,11 +159,14 @@ The Supervisord Exporter exposes the following Prometheus metrics:
 If the Supervisord XML-RPC endpoint becomes unreachable, `supervisord_up` drops to 0 immediately, but `supervisor_process_info`/`supervisor_process_uptime` keep reporting the last known values for up to `-stale-grace-period` (default `1m`) so a brief hiccup doesn't make every process's metrics disappear. If the outage outlasts that grace period, those metrics are cleared, since serving arbitrarily old process/uptime data during a real outage would be misleading.
 
 
-Sample metric:
+Sample metrics:
 ```
 supervisor_process_info{exit_status="0",group="apache2",name="apache2",state="RUNNING"} 1
-supervisord_up{} 1
+supervisor_process_uptime{group="apache2",name="apache2"} 12345
+supervisord_up 1
+supervisor_last_successful_scrape_timestamp_seconds 1.700000000e+09
 ```
+`supervisor_last_successful_scrape_timestamp_seconds` is only present after the first successful scrape — it's entirely absent from the output before that, not zero.
 
 ### License
 

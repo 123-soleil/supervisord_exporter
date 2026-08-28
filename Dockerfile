@@ -1,10 +1,9 @@
-FROM golang:alpine as builder
+FROM golang:1.24-alpine AS builder
 WORKDIR /app
-ADD go.mod /app
-ADD go.sum /app
+COPY go.mod go.sum ./
 RUN go mod download
-ADD supervisord_exporter.go /app
+COPY . .
 RUN CGO_ENABLED=0 go build .
 FROM alpine
 COPY --from=builder /app/supervisord_exporter /usr/bin/supervisord_exporter
-ENTRYPOINT /usr/bin/supervisord_exporter
+ENTRYPOINT ["/usr/bin/supervisord_exporter"]
