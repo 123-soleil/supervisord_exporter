@@ -231,10 +231,14 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		return nil, "", fmt.Errorf("failed to parse URL: %v", err)
 	}
 
-	var baseTransport *http.Transport
+	// Cloned once here (rather than duplicated in each scheme branch below) for
+	// its tuned defaults — MaxIdleConns, IdleConnTimeout, etc. — which the unix
+	// branch then overrides only how it dials.
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
 	clientURL := targetURL
 
-	if parsedURL.Scheme == "unix" {
+	switch parsedURL.Scheme {
+	case "unix":
 		// A unix:// URL must use three slashes (unix:///path/to.sock) so the whole
 		// path lands in parsedURL.Path; with only two slashes, url.Parse silently
 		// puts the first path segment into Host instead, which would dial the
@@ -243,26 +247,29 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 			return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", targetURL)
 		}
 		if parsedURL.Path == "" {
+			if parsedURL.Opaque != "" {
+				// e.g. "unix:var/run/x.sock" (no "//"): url.Parse puts the given
+				// path in Opaque instead of Path, so point at the actual fix
+				// rather than claiming no path was given at all.
+				return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///%s (three slashes)", targetURL, parsedURL.Opaque)
+			}
 			return nil, "", fmt.Errorf("invalid unix socket URL %q: missing socket path", targetURL)
 		}
-		// For Unix sockets, clone the default transport (for its tuned defaults —
-		// MaxIdleConns, IdleConnTimeout, etc.) and just override how it dials.
 		socketPath := parsedURL.Path
-		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
 		baseTransport.DialContext = func(ctx context.Context, proto, addr string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		}
 		// Return a fake HTTP URL for the xmlrpc client, the transport will handle the actual connection
 		clientURL = "http://localhost/RPC2"
-	} else if parsedURL.Scheme == "http" || parsedURL.Scheme == "https" {
-		// For HTTP/HTTPS, use a default transport clone
-		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
-	} else {
-		// Anything else — including a missing/misparsed scheme from a typo like
-		// "localhost:9001/RPC2" (no "http://"), which url.Parse would otherwise
-		// silently accept as scheme "localhost" — is rejected here rather than
-		// falling through to the HTTP path and only failing cryptically on the
-		// first scrape.
+	case "http", "https":
+		if parsedURL.Host == "" {
+			return nil, "", fmt.Errorf("invalid -supervisord-url %q: missing host", targetURL)
+		}
+	default:
+		// Including a missing/misparsed scheme from a typo like "localhost:9001/RPC2"
+		// (no "http://"), which url.Parse would otherwise silently accept as scheme
+		// "localhost" — rejected here rather than falling through to the HTTP path
+		// and only failing cryptically on the first scrape.
 		return nil, "", fmt.Errorf("invalid -supervisord-url %q: unsupported scheme %q (expected http, https, or unix)", targetURL, parsedURL.Scheme)
 	}
 
