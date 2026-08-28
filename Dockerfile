@@ -3,6 +3,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+RUN CGO_ENABLED=0 go test ./...
 RUN CGO_ENABLED=0 go build .
 FROM alpine
 COPY --from=builder /app/supervisord_exporter /usr/bin/supervisord_exporter
