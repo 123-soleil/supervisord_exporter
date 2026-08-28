@@ -164,7 +164,12 @@ func publishSnapshot(snap *snapshot) {
 func markDown() {
 	prev := currentSnapshot.Load()
 	processes := prev.processes
-	if !prev.lastSuccess.IsZero() && time.Since(prev.lastSuccess) > staleGracePeriod {
+	// The processes != nil guard makes this a one-time transition: once a sustained
+	// outage has already cleared the list, every later failed scrape sees processes
+	// already nil and skips straight past, instead of re-logging this warning (and
+	// redundantly re-nil'ing an already-nil list) on every single scrape for the
+	// rest of the outage.
+	if processes != nil && !prev.lastSuccess.IsZero() && time.Since(prev.lastSuccess) > staleGracePeriod {
 		log.Printf("Warning: no successful Supervisord scrape in over %s (stale-grace-period); clearing previously reported process metrics", staleGracePeriod)
 		processes = nil
 	}
@@ -332,6 +337,11 @@ func fetchSupervisorProcessInfo() {
 		}
 	}
 
+	// Captured once so every metric published from this scrape (each process's
+	// uptime and the snapshot's lastSuccess) reflects the same instant, rather
+	// than drifting apart across a loop over many processes.
+	now := time.Now()
+
 	processes := make([]processSample, 0, len(latestInfo))
 
 	for _, data := range latestInfo {
@@ -352,7 +362,7 @@ func fetchSupervisorProcessInfo() {
 
 		if sample.running {
 			if startTimeOk {
-				uptime := time.Now().Unix() - startTime
+				uptime := now.Unix() - startTime
 				if uptime < 0 {
 					log.Printf("Warning: process %s/%s has a start time in the future (clock skew?); clamping uptime to 0", name, group)
 					uptime = 0
@@ -367,7 +377,7 @@ func fetchSupervisorProcessInfo() {
 		processes = append(processes, sample)
 	}
 
-	publishSnapshot(&snapshot{up: 1, processes: processes, lastSuccess: time.Now()})
+	publishSnapshot(&snapshot{up: 1, processes: processes, lastSuccess: now})
 }
 
 var promHandler = promhttp.Handler()
@@ -379,6 +389,13 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	flag.Parse()
+
+	// -version short-circuits everything else, including flag validation below:
+	// it's expected to work even if other flags are missing or invalid.
+	if version {
+		fmt.Printf("Supervisor Exporter v%s\n", appVersion)
+		os.Exit(0)
+	}
 
 	if staleGracePeriod < 0 {
 		log.Fatalf("Error: -stale-grace-period must be >= 0, got %s", staleGracePeriod)
@@ -394,11 +411,6 @@ func main() {
 	}
 	if (username != "") != (password != "") {
 		log.Printf("Warning: only one of username/password is set; Supervisord authentication will be disabled")
-	}
-
-	if version {
-		fmt.Printf("Supervisor Exporter v%s\n", appVersion)
-		os.Exit(0)
 	}
 
 	// Built once and reused for every scrape; supervisordURL/username/password/rpcTimeout
