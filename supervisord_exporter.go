@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
@@ -29,7 +31,15 @@ var (
 	rpcTimeout       time.Duration
 	staleGracePeriod time.Duration
 	version          bool
-	appVersion       = "0.4"
+	appVersion       = "0.5"
+
+	// TLS/mTLS for the /metrics endpoint served to Prometheus. webTLSCertFile and
+	// webTLSKeyFile must be set together to enable HTTPS; webTLSClientCAFile
+	// additionally requires them and turns on mTLS (only clients presenting a
+	// certificate signed by that CA are accepted).
+	webTLSCertFile     string
+	webTLSKeyFile      string
+	webTLSClientCAFile string
 
 	// rpcTransport and rpcClientURL are built once at startup from the (static)
 	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
@@ -129,6 +139,9 @@ func init() {
 	flag.StringVar(&password, "password", "", "Password for Supervisord authentication (prefer SUPERVISORD_PASSWORD env var to avoid leaking it via process listings)")
 	flag.DurationVar(&rpcTimeout, "supervisord-timeout", 10*time.Second, "Timeout for XML-RPC requests to Supervisord")
 	flag.DurationVar(&staleGracePeriod, "stale-grace-period", time.Minute, "How long to keep serving the last known process metrics (with supervisord_up=0) after Supervisord becomes unreachable, before clearing them as too stale to trust. It's only re-evaluated on each scrape, so set it well above your Prometheus scrape_interval or it won't tolerate even one hiccup; 0 disables the grace period entirely")
+	flag.StringVar(&webTLSCertFile, "web.tls-cert-file", "", "Path to a PEM certificate (optionally with intermediates) to serve /metrics over HTTPS. Requires -web.tls-key-file")
+	flag.StringVar(&webTLSKeyFile, "web.tls-key-file", "", "Path to the PEM private key matching -web.tls-cert-file")
+	flag.StringVar(&webTLSClientCAFile, "web.tls-client-ca-file", "", "Path to a PEM CA bundle used to verify client certificates for mTLS; only clients presenting a certificate signed by this CA are accepted. Requires -web.tls-cert-file and -web.tls-key-file")
 	flag.BoolVar(&version, "version", false, "Displays application version")
 
 	currentSnapshot.Store(&snapshot{})
@@ -484,6 +497,14 @@ func main() {
 		log.Fatalf("Error: -supervisord-timeout must be > 0, got %s", rpcTimeout)
 	}
 
+	tlsEnabled := webTLSCertFile != "" || webTLSKeyFile != ""
+	if (webTLSCertFile != "") != (webTLSKeyFile != "") {
+		log.Fatalf("Error: -web.tls-cert-file and -web.tls-key-file must both be set together")
+	}
+	if webTLSClientCAFile != "" && !tlsEnabled {
+		log.Fatalf("Error: -web.tls-client-ca-file requires -web.tls-cert-file and -web.tls-key-file to also be set")
+	}
+
 	// Prefer environment variables for credentials over CLI flags, which are
 	// visible to other local users via the process list (e.g. `ps aux`).
 	if v := os.Getenv("SUPERVISORD_USERNAME"); v != "" {
@@ -511,6 +532,29 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      rpcTimeout + 10*time.Second,
+	}
+
+	if tlsEnabled {
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+		if webTLSClientCAFile != "" {
+			caPEM, err := os.ReadFile(webTLSClientCAFile)
+			if err != nil {
+				log.Fatalf("Error reading -web.tls-client-ca-file: %v", err)
+			}
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(caPEM) {
+				log.Fatalf("Error: -web.tls-client-ca-file %q contains no valid PEM certificates", webTLSClientCAFile)
+			}
+			tlsConfig.ClientCAs = caPool
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+		server.TLSConfig = tlsConfig
+
+		log.Printf("Listening on %s (HTTPS, mTLS: %v)", listenAddress, webTLSClientCAFile != "")
+		if err := server.ListenAndServeTLS(webTLSCertFile, webTLSKeyFile); err != nil {
+			log.Fatalf("Error: %s", err)
+		}
+		return
 	}
 
 	log.Printf("Listening on %s", listenAddress)

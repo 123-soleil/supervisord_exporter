@@ -123,6 +123,8 @@ The Supervisord Exporter can be configured using command line parameters. Here a
 * `-stale-grace-period`: How long to keep serving the last known process metrics (with `supervisord_up=0`) after Supervisord becomes unreachable, before clearing them as too stale to trust. Default is `1m`. This is only re-evaluated on each scrape, so set it well above your Prometheus `scrape_interval` — if it's shorter than (or close to) `scrape_interval`, the very first failed scrape may already exceed it and clear the metrics immediately, defeating the point. Set to `0` to disable the grace period (clear immediately on any failure).
 * `-web.listen-address`: The address and port where the exporter will listen for HTTP requests. Default is `:9876`
 * `-web.telemetry-path`: Path under which to expose metrics. Default is `/metrics`
+* `-web.tls-cert-file` / `-web.tls-key-file`: Path to a PEM certificate and matching private key to serve `/metrics` over HTTPS instead of plain HTTP. Both must be set together. Once set, the exporter only accepts HTTPS connections on `-web.listen-address` — a plain HTTP request gets a `400 Bad Request`.
+* `-web.tls-client-ca-file`: Path to a PEM CA bundle used to verify client certificates (mTLS). Requires `-web.tls-cert-file`/`-web.tls-key-file` to also be set. Once set, only clients presenting a certificate signed by this CA can connect — anyone else's TLS handshake is rejected outright.
 * `-version`: Print the version information and exit.
 
 Examples of custom configurations:
@@ -146,6 +148,17 @@ Examples of custom configurations:
 ```shell
 SUPERVISORD_USERNAME="dummy" SUPERVISORD_PASSWORD="dummy" ./supervisord_exporter -supervisord-url="http://example.com:9001/RPC2"
 ```
+
+**Serving `/metrics` over HTTPS:**
+```shell
+./supervisord_exporter -web.tls-cert-file="/etc/exporter/tls.crt" -web.tls-key-file="/etc/exporter/tls.key"
+```
+
+**Serving `/metrics` over HTTPS with mutual TLS (mTLS):**
+```shell
+./supervisord_exporter -web.tls-cert-file="/etc/exporter/tls.crt" -web.tls-key-file="/etc/exporter/tls.key" -web.tls-client-ca-file="/etc/exporter/client-ca.crt"
+```
+Prometheus then needs a matching client certificate/key configured in its scrape config (`tls_config.cert_file`/`key_file`), signed by that same CA.
 
 ### Prometheus Metrics
 
