@@ -20,7 +20,7 @@ The Supervisor Exporter is a simple Go application that collects process status 
 - Configurable via command line parameters.
 - Provides a simple HTTP server for Prometheus to scrape metrics.
 - Handles unreachable Supervisord XML-RPC endpoints gracefully.
-- Supports both HTTP and Unix socket connections to Supervisord.
+- Supports HTTP, HTTPS, and Unix socket connections to Supervisord.
 - Supports authentication with username and password.
 - Can serve `/metrics` over HTTPS, optionally with mutual TLS (mTLS) client certificate verification.
 
@@ -115,9 +115,10 @@ By default, the exporter will listen on port 9876 and use the Supervisor XML-RPC
 
 The Supervisord Exporter can be configured using command line parameters. Here are the available parameters:
 
-* `-supervisord-url`: The URL of the Supervisord XML-RPC interface. Supports both HTTP and Unix socket schemes. Default is `http://localhost:9001/RPC2`
+* `-supervisord-url`: The URL of the Supervisord XML-RPC interface. Supports `http://`, `https://`, and `unix://` schemes. Default is `http://localhost:9001/RPC2`
   * HTTP example: `http://localhost:9001/RPC2`
-  * Unix socket example: `unix:///run/supervisord/supervisor.sock`
+  * HTTPS example (e.g. Supervisord behind a TLS-terminating reverse proxy): `https://supervisord.internal:9001/RPC2`
+  * Unix socket example: `unix:///run/supervisord/supervisor.sock`. Note: the Docker image runs the exporter as a non-root user, so it needs read/write access to the socket file (matching group/permissions, or a bind mount with appropriate ownership).
 * `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list. If only one of username/password is set, authentication is silently disabled entirely (a warning is logged) — Supervisord is then scraped unauthenticated rather than the exporter failing to start.
 * `-password`: Password for Supervisord authentication (optional). Prefer the `SUPERVISORD_PASSWORD` environment variable, since CLI flags are visible to other local users via the process list.
 * `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`

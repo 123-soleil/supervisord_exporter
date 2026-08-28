@@ -1,1 +1,3 @@
 .git
+supervisord_exporter
+*.test

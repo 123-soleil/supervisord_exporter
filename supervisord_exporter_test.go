@@ -304,6 +304,86 @@ func TestMetrics_RunningProcessMissingStartTime(t *testing.T) {
 	assertContains(t, ep.stderr.String(), "is RUNNING but has no valid start time")
 }
 
+func TestMetrics_UnixSocket(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "supervisor.sock")
+	body := buildGetAllProcessInfoXML([]fakeProcess{
+		{Name: "runner", Group: "g", State: "RUNNING", ExitStatus: 0, Start: 1700000000},
+	})
+
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen on unix socket: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	})}
+	go srv.Serve(l) //nolint:errcheck // closed via t.Cleanup below
+	t.Cleanup(func() { srv.Close() })
+
+	// Exercises the exporter talking to Supervisord over a real unix domain
+	// socket end-to-end (every other test uses httptest's TCP listener), so a
+	// regression in the unix DialContext override or the fake client URL
+	// substitution wouldn't otherwise be caught.
+	ep := startExporter(t, "-supervisord-url=unix://"+sockPath)
+	client := &http.Client{Timeout: 5 * time.Second}
+	ep.waitReady(t, "http", client, 5*time.Second)
+
+	out := ep.metrics(t, "http", client)
+	assertContains(t, out, "supervisord_up 1")
+	assertContains(t, out, `supervisor_process_info{exit_status="0",group="g",name="runner",state="RUNNING"} 1`)
+}
+
+func TestBasicAuth_CorrectCredentialsSucceed(t *testing.T) {
+	const user, pass = "dummy", "s3cret"
+	body := buildGetAllProcessInfoXML([]fakeProcess{
+		{Name: "runner", Group: "g", State: "RUNNING", ExitStatus: 0, Start: 1700000000},
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPass, ok := r.BasicAuth()
+		if !ok || gotUser != user || gotPass != pass {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	ep := startExporter(t,
+		"-supervisord-url="+srv.URL+"/RPC2",
+		"-username="+user,
+		"-password="+pass,
+	)
+	client := &http.Client{Timeout: 5 * time.Second}
+	ep.waitReady(t, "http", client, 5*time.Second)
+
+	out := ep.metrics(t, "http", client)
+	assertContains(t, out, "supervisord_up 1")
+	assertContains(t, out, `supervisor_process_info{exit_status="0",group="g",name="runner",state="RUNNING"} 1`)
+}
+
+func TestBasicAuth_WrongCredentialsFail(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPass, ok := r.BasicAuth()
+		if !ok || gotUser != "dummy" || gotPass != "correct" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write(buildGetAllProcessInfoXML(nil))
+	}))
+	t.Cleanup(srv.Close)
+
+	ep := startExporter(t,
+		"-supervisord-url="+srv.URL+"/RPC2",
+		"-username=dummy",
+		"-password=wrong",
+	)
+	client := &http.Client{Timeout: 5 * time.Second}
+	ep.waitReady(t, "http", client, 5*time.Second)
+
+	out := ep.metrics(t, "http", client)
+	assertContains(t, out, "supervisord_up 0")
+}
+
 func TestMetrics_SupervisordUnreachable(t *testing.T) {
 	closedAddr := freeAddr(t) // nothing listens here
 
