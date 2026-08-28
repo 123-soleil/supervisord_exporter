@@ -97,20 +97,30 @@ func (b *cancelOnCloseBody) Close() error {
 	return err
 }
 
-// createTransport creates an HTTP transport that supports both HTTP and Unix socket connections
-func createTransport(targetURL string) (http.RoundTripper, string, error) {
+// createTransport creates an HTTP transport that supports both HTTP and Unix socket connections.
+// It also returns the base *http.Transport so callers can release its idle connections themselves:
+// once wrapped in timeoutTransport (and possibly authenticatedTransport), kolo/xmlrpc's own
+// best-effort CloseIdleConnections() type-assertion on Client.Close() no longer matches.
+func createTransport(targetURL string) (http.RoundTripper, string, *http.Transport, error) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to parse URL: %v", err)
+		return nil, "", nil, fmt.Errorf("failed to parse URL: %v", err)
 	}
 
-	var transport http.RoundTripper
+	var baseTransport *http.Transport
 	clientURL := targetURL
 
 	if parsedURL.Scheme == "unix" {
+		// A unix:// URL must use three slashes (unix:///path/to.sock) so the whole
+		// path lands in parsedURL.Path; with only two slashes, url.Parse silently
+		// puts the first path segment into Host instead, which would dial the
+		// wrong socket without any error.
+		if parsedURL.Host != "" {
+			return nil, "", nil, fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", targetURL)
+		}
 		// For Unix sockets, we need to use a custom transport
 		socketPath := parsedURL.Path
-		transport = &http.Transport{
+		baseTransport = &http.Transport{
 			DialContext: func(ctx context.Context, proto, addr string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 			},
@@ -119,8 +129,10 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		clientURL = "http://localhost/RPC2"
 	} else {
 		// For HTTP/HTTPS, use a default transport clone
-		transport = http.DefaultTransport.(*http.Transport).Clone()
+		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
 	}
+
+	var transport http.RoundTripper = baseTransport
 
 	// Apply authentication if credentials are provided
 	if username != "" && password != "" {
@@ -133,7 +145,7 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 
 	// Bound the whole request/response cycle so a hung or slow Supervisord
 	// can't block a scrape indefinitely.
-	return &timeoutTransport{Transport: transport, Timeout: rpcTimeout}, clientURL, nil
+	return &timeoutTransport{Transport: transport, Timeout: rpcTimeout}, clientURL, baseTransport, nil
 }
 
 // authenticatedTransport wraps http.RoundTripper to add Basic Authentication
@@ -164,7 +176,7 @@ func fetchSupervisorProcessInfo() {
 	fetchMu.Lock()
 	defer fetchMu.Unlock()
 
-	transport, clientURL, err := createTransport(supervisordURL)
+	transport, clientURL, baseTransport, err := createTransport(supervisordURL)
 	if err != nil {
 		log.Printf("Error creating transport: %v", err)
 		supervisordUp.Set(0)
@@ -172,6 +184,7 @@ func fetchSupervisorProcessInfo() {
 		supervisorProcessUptime.Reset()
 		return
 	}
+	defer baseTransport.CloseIdleConnections()
 
 	client, err := xmlrpc.NewClient(clientURL, transport)
 	if err != nil {
@@ -246,9 +259,11 @@ func fetchSupervisorProcessInfo() {
 	}
 }
 
+var promHandler = promhttp.Handler()
+
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fetchSupervisorProcessInfo()
-	promhttp.Handler().ServeHTTP(w, r)
+	promHandler.ServeHTTP(w, r)
 }
 
 func main() {
@@ -262,6 +277,9 @@ func main() {
 	if v := os.Getenv("SUPERVISORD_PASSWORD"); v != "" {
 		password = v
 	}
+	if (username != "") != (password != "") {
+		log.Printf("Warning: only one of username/password is set; Supervisord authentication will be disabled")
+	}
 
 	if version {
 		fmt.Printf("Supervisor Exporter v%v\n", appVersion)
@@ -270,8 +288,15 @@ func main() {
 
 	http.HandleFunc(metricsPath, metricsHandler)
 
+	server := &http.Server{
+		Addr:              listenAddress,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      rpcTimeout + 10*time.Second,
+	}
+
 	fmt.Printf("Listening on %s\n", listenAddress)
-	if err := http.ListenAndServe(listenAddress, nil); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		fmt.Printf("Error: %s\n", err)
 		os.Exit(1)
 	}
