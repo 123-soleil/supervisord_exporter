@@ -305,7 +305,13 @@ func TestMetrics_RunningProcessMissingStartTime(t *testing.T) {
 }
 
 func TestMetrics_UnixSocket(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "supervisor.sock")
+	// Deliberately not under t.TempDir(): that nests several directory levels
+	// under the OS temp dir, which on some platforms (e.g. macOS's
+	// /var/folders/.../T/...) can push the socket path close to or past
+	// AF_UNIX's sun_path limit (~104-108 bytes). os.TempDir() directly plus a
+	// short, unique filename keeps this portable.
+	sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("se_test_%d.sock", os.Getpid()))
+	t.Cleanup(func() { os.Remove(sockPath) })
 	body := buildGetAllProcessInfoXML([]fakeProcess{
 		{Name: "runner", Group: "g", State: "RUNNING", ExitStatus: 0, Start: 1700000000},
 	})
@@ -475,6 +481,7 @@ func TestInvalidConfigFailsFast(t *testing.T) {
 		{"negative timeout", []string{"-supervisord-timeout=-1s"}, "must be > 0"},
 		{"tls cert without key", []string{"-web.tls-cert-file=/nonexistent.crt"}, "must both be set together"},
 		{"tls client ca without cert/key", []string{"-web.tls-client-ca-file=/nonexistent.crt"}, "requires -web.tls-cert-file"},
+		{"supervisord tls ca file missing", []string{"-supervisord-url=https://example.invalid/RPC2", "-supervisord-tls-ca-file=/nonexistent-ca.crt"}, "reading -supervisord-tls-ca-file"},
 	}
 
 	for _, tc := range cases {
@@ -584,6 +591,63 @@ func writeTemp(t *testing.T, dir, name string, data []byte) string {
 		t.Fatalf("writing %s: %v", p, err)
 	}
 	return p
+}
+
+func TestMetrics_SupervisordHTTPSWithCustomCA(t *testing.T) {
+	pki := generateTestPKI(t)
+	dir := t.TempDir()
+	caPath := writeTemp(t, dir, "ca.crt", pki.caCertPEM)
+
+	serverCert, err := tls.X509KeyPair(pki.serverCertPEM, pki.serverKeyPEM)
+	if err != nil {
+		t.Fatalf("loading server keypair: %v", err)
+	}
+	body := buildGetAllProcessInfoXML([]fakeProcess{
+		{Name: "runner", Group: "g", State: "RUNNING", ExitStatus: 0, Start: 1700000000},
+	})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{serverCert}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	// -supervisord-tls-ca-file trusts the private CA that signed the fake
+	// Supervisord's server certificate, so the scrape should succeed even
+	// though that CA isn't in the system trust store.
+	ep := startExporter(t,
+		"-supervisord-url="+srv.URL+"/RPC2",
+		"-supervisord-tls-ca-file="+caPath,
+	)
+	client := &http.Client{Timeout: 5 * time.Second}
+	ep.waitReady(t, "http", client, 5*time.Second)
+
+	out := ep.metrics(t, "http", client)
+	assertContains(t, out, "supervisord_up 1")
+	assertContains(t, out, `supervisor_process_info{exit_status="0",group="g",name="runner",state="RUNNING"} 1`)
+}
+
+func TestMetrics_SupervisordHTTPSWithoutTrustedCAFails(t *testing.T) {
+	pki := generateTestPKI(t)
+	serverCert, err := tls.X509KeyPair(pki.serverCertPEM, pki.serverKeyPEM)
+	if err != nil {
+		t.Fatalf("loading server keypair: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(buildGetAllProcessInfoXML(nil))
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{serverCert}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	// No -supervisord-tls-ca-file: the self-signed cert isn't in the system
+	// trust store, so every scrape must fail rather than silently succeed.
+	ep := startExporter(t, "-supervisord-url="+srv.URL+"/RPC2", "-supervisord-timeout=2s")
+	client := &http.Client{Timeout: 5 * time.Second}
+	ep.waitReady(t, "http", client, 5*time.Second)
+
+	out := ep.metrics(t, "http", client)
+	assertContains(t, out, "supervisord_up 0")
 }
 
 func TestTLS_PlainHTTPRejected_HTTPSAccepted(t *testing.T) {

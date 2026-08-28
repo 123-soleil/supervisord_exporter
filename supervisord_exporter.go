@@ -41,6 +41,11 @@ var (
 	webTLSKeyFile      string
 	webTLSClientCAFile string
 
+	// supervisordTLSCAFile lets an https:// -supervisord-url trust a private/
+	// internal CA (e.g. a self-signed cert on a TLS-terminating reverse proxy in
+	// front of Supervisord) instead of only the system trust store.
+	supervisordTLSCAFile string
+
 	// rpcTransport and rpcClientURL are built once at startup from the (static)
 	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
 	// across scrapes, so the underlying connection pool is shared instead of
@@ -132,12 +137,13 @@ type snapshot struct {
 }
 
 func init() {
-	flag.StringVar(&supervisordURL, "supervisord-url", "http://localhost:9001/RPC2", "Supervisord XML-RPC URL (supports http:// and unix:// schemes)")
+	flag.StringVar(&supervisordURL, "supervisord-url", "http://localhost:9001/RPC2", "Supervisord XML-RPC URL (supports http://, https://, and unix:// schemes)")
 	flag.StringVar(&listenAddress, "web.listen-address", ":9876", "Address to listen for HTTP requests")
 	flag.StringVar(&metricsPath, "web.telemetry-path", "/metrics", "Path under which to expose metrics")
 	flag.StringVar(&username, "username", "", "Username for Supervisord authentication (prefer SUPERVISORD_USERNAME env var)")
 	flag.StringVar(&password, "password", "", "Password for Supervisord authentication (prefer SUPERVISORD_PASSWORD env var to avoid leaking it via process listings)")
 	flag.DurationVar(&rpcTimeout, "supervisord-timeout", 10*time.Second, "Timeout for XML-RPC requests to Supervisord")
+	flag.StringVar(&supervisordTLSCAFile, "supervisord-tls-ca-file", "", "Path to a PEM CA bundle to trust when -supervisord-url uses https:// with a certificate not signed by a system-trusted CA (e.g. a private/internal CA on a TLS-terminating reverse proxy in front of Supervisord). If unset, only the system trust store is used")
 	flag.DurationVar(&staleGracePeriod, "stale-grace-period", time.Minute, "How long to keep serving the last known process metrics (with supervisord_up=0) after Supervisord becomes unreachable, before clearing them as too stale to trust. It's only re-evaluated on each scrape, so set it well above your Prometheus scrape_interval or it won't tolerate even one hiccup; 0 disables the grace period entirely")
 	flag.StringVar(&webTLSCertFile, "web.tls-cert-file", "", "Path to a PEM certificate (optionally with intermediates) to serve /metrics over HTTPS. Requires -web.tls-key-file")
 	flag.StringVar(&webTLSKeyFile, "web.tls-key-file", "", "Path to the PEM private key matching -web.tls-cert-file")
@@ -309,6 +315,17 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		// would be ":9001" (non-empty) there, while Hostname() is correctly "".
 		if parsedURL.Hostname() == "" {
 			return nil, "", fmt.Errorf("invalid -supervisord-url %q: missing host", targetURL)
+		}
+		if supervisordTLSCAFile != "" {
+			caPEM, err := os.ReadFile(supervisordTLSCAFile)
+			if err != nil {
+				return nil, "", fmt.Errorf("reading -supervisord-tls-ca-file: %v", err)
+			}
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(caPEM) {
+				return nil, "", fmt.Errorf("-supervisord-tls-ca-file %q contains no valid PEM certificates", supervisordTLSCAFile)
+			}
+			baseTransport.TLSClientConfig = &tls.Config{RootCAs: caPool}
 		}
 	default:
 		// Including a missing/misparsed scheme from a typo like "localhost:9001/RPC2"

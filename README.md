@@ -118,16 +118,19 @@ The Supervisord Exporter can be configured using command line parameters. Here a
 * `-supervisord-url`: The URL of the Supervisord XML-RPC interface. Supports `http://`, `https://`, and `unix://` schemes. Default is `http://localhost:9001/RPC2`
   * HTTP example: `http://localhost:9001/RPC2`
   * HTTPS example (e.g. Supervisord behind a TLS-terminating reverse proxy): `https://supervisord.internal:9001/RPC2`
-  * Unix socket example: `unix:///run/supervisord/supervisor.sock`. Note: the Docker image runs the exporter as a non-root user, so it needs read/write access to the socket file (matching group/permissions, or a bind mount with appropriate ownership).
+  * Unix socket example: `unix:///run/supervisord/supervisor.sock`.
 * `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list. If only one of username/password is set, authentication is silently disabled entirely (a warning is logged) — Supervisord is then scraped unauthenticated rather than the exporter failing to start.
 * `-password`: Password for Supervisord authentication (optional). Prefer the `SUPERVISORD_PASSWORD` environment variable, since CLI flags are visible to other local users via the process list.
 * `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`
+* `-supervisord-tls-ca-file`: Path to a PEM CA bundle to trust when `-supervisord-url` uses `https://` with a certificate not signed by a system-trusted CA (e.g. a private/internal CA on a reverse proxy in front of Supervisord). If unset, only the system trust store is used, and an untrusted certificate makes every scrape fail with `supervisord_up 0`.
 * `-stale-grace-period`: How long to keep serving the last known process metrics (with `supervisord_up=0`) after Supervisord becomes unreachable, before clearing them as too stale to trust. Default is `1m`. This is only re-evaluated on each scrape, so set it well above your Prometheus `scrape_interval` — if it's shorter than (or close to) `scrape_interval`, the very first failed scrape may already exceed it and clear the metrics immediately, defeating the point. Set to `0` to disable the grace period (clear immediately on any failure).
 * `-web.listen-address`: The address and port where the exporter will listen for HTTP requests. Default is `:9876`
 * `-web.telemetry-path`: Path under which to expose metrics. Default is `/metrics`
 * `-web.tls-cert-file` / `-web.tls-key-file`: Path to a PEM certificate and matching private key to serve `/metrics` over HTTPS instead of plain HTTP. Both must be set together. Once set, the exporter only accepts HTTPS connections on `-web.listen-address` — a plain HTTP request gets a `400 Bad Request`.
 * `-web.tls-client-ca-file`: Path to a PEM CA bundle used to verify client certificates (mTLS). Requires `-web.tls-cert-file`/`-web.tls-key-file` to also be set. Once set, only clients presenting a certificate signed by this CA can connect — anyone else's TLS handshake is rejected outright.
 * `-version`: Print the version information and exit.
+
+**Note for the Docker image:** it runs the exporter as a non-root user, so any file it needs to read must be readable by that user — the Supervisord unix socket (`-supervisord-url=unix://...`), the CA bundles (`-supervisord-tls-ca-file`, `-web.tls-client-ca-file`), and the TLS certificate/key (`-web.tls-cert-file`/`-web.tls-key-file`). If you're upgrading from an image version that ran as root, mounted files previously readable only by root (e.g. `0600 root:root`) will need their ownership/permissions adjusted, or the container will fail with a permission error reading them.
 
 Examples of custom configurations:
 
