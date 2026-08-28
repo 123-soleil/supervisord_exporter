@@ -11,7 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kolo/xmlrpc"
@@ -67,12 +67,11 @@ var (
 		nil,
 	)
 
-	// snapshotMu guards currentSnapshot. A scrape publishes a brand new *snapshot
-	// built entirely off to the side and only then swaps the pointer in, so a
-	// concurrent Collect() always sees either the previous fully-formed snapshot
-	// or the new one — never a partially-populated one.
-	snapshotMu      sync.RWMutex
-	currentSnapshot = &snapshot{}
+	// currentSnapshot is swapped atomically: a scrape builds a brand new *snapshot
+	// entirely off to the side and only then stores the pointer, so a concurrent
+	// Collect() always sees either the previous fully-formed snapshot or the new
+	// one — never a partially-populated one.
+	currentSnapshot atomic.Pointer[snapshot]
 )
 
 // processSample is one process's data as published to Prometheus.
@@ -99,6 +98,7 @@ func init() {
 	flag.DurationVar(&rpcTimeout, "supervisord-timeout", 10*time.Second, "Timeout for XML-RPC requests to Supervisord")
 	flag.BoolVar(&version, "version", false, "Displays application version")
 
+	currentSnapshot.Store(&snapshot{})
 	prometheus.MustRegister(supervisorCollector{})
 }
 
@@ -115,9 +115,7 @@ func (supervisorCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (supervisorCollector) Collect(ch chan<- prometheus.Metric) {
-	snapshotMu.RLock()
-	snap := currentSnapshot
-	snapshotMu.RUnlock()
+	snap := currentSnapshot.Load()
 
 	ch <- prometheus.MustNewConstMetric(supervisordUpDesc, prometheus.GaugeValue, snap.up)
 
@@ -134,9 +132,15 @@ func (supervisorCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func publishSnapshot(snap *snapshot) {
-	snapshotMu.Lock()
-	currentSnapshot = snap
-	snapshotMu.Unlock()
+	currentSnapshot.Store(snap)
+}
+
+// markDown flags the Supervisord connection as down while keeping the last known
+// process list, so a single transient RPC hiccup doesn't make every process's
+// metrics vanish for that scrape — only supervisord_up drops, exactly as before
+// the hiccup started, until a subsequent fetch succeeds or genuinely finds nothing.
+func markDown() {
+	currentSnapshot.Store(&snapshot{up: 0, processes: currentSnapshot.Load().processes})
 }
 
 // timeoutTransport bounds the total time spent reading a request's headers and body,
@@ -259,7 +263,7 @@ func fetchSupervisorProcessInfo() {
 	client, err := xmlrpc.NewClient(rpcClientURL, rpcTransport)
 	if err != nil {
 		log.Printf("Error creating Supervisor XML-RPC client: %v", err)
-		publishSnapshot(&snapshot{})
+		markDown()
 		return
 	}
 	defer client.Close()
@@ -267,7 +271,7 @@ func fetchSupervisorProcessInfo() {
 	result := []map[string]interface{}{}
 	if err := client.Call("supervisor.getAllProcessInfo", nil, &result); err != nil {
 		log.Printf("Error calling Supervisor XML-RPC method: %v", err)
-		publishSnapshot(&snapshot{})
+		markDown()
 		return
 	}
 
