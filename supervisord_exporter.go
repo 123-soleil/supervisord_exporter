@@ -4,11 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/kolo/xmlrpc"
@@ -22,8 +24,11 @@ var (
 	metricsPath    string
 	username       string
 	password       string
+	rpcTimeout     time.Duration
 	version        bool
 	appVersion     float32 = 0.1
+
+	fetchMu sync.Mutex
 
 	processesMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -51,15 +56,45 @@ func init() {
 	flag.StringVar(&supervisordURL, "supervisord-url", "http://localhost:9001/RPC2", "Supervisord XML-RPC URL (supports http:// and unix:// schemes)")
 	flag.StringVar(&listenAddress, "web.listen-address", ":9876", "Address to listen for HTTP requests")
 	flag.StringVar(&metricsPath, "web.telemetry-path", "/metrics", "Path under which to expose metrics")
-	flag.StringVar(&username, "username", "", "Username for Supervisord authentication")
-	flag.StringVar(&password, "password", "", "Password for Supervisord authentication")
+	flag.StringVar(&username, "username", "", "Username for Supervisord authentication (prefer SUPERVISORD_USERNAME env var)")
+	flag.StringVar(&password, "password", "", "Password for Supervisord authentication (prefer SUPERVISORD_PASSWORD env var to avoid leaking it via process listings)")
+	flag.DurationVar(&rpcTimeout, "supervisord-timeout", 10*time.Second, "Timeout for XML-RPC requests to Supervisord")
 	flag.BoolVar(&version, "version", false, "Displays application version")
-
-	flag.Parse()
 
 	prometheus.MustRegister(processesMetric)
 	prometheus.MustRegister(supervisorProcessUptime)
 	prometheus.MustRegister(supervisordUp)
+}
+
+// timeoutTransport bounds the total time spent reading a request's headers and body,
+// canceling the request context when the response body is closed.
+type timeoutTransport struct {
+	Transport http.RoundTripper
+	Timeout   time.Duration
+}
+
+func (t *timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(req.Context(), t.Timeout)
+	resp, err := t.Transport.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// cancelOnCloseBody cancels its associated context once the response body is closed,
+// which is when the xmlrpc codec is done reading it.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // createTransport creates an HTTP transport that supports both HTTP and Unix socket connections
@@ -69,39 +104,36 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		return nil, "", fmt.Errorf("failed to parse URL: %v", err)
 	}
 
+	var transport http.RoundTripper
+	clientURL := targetURL
+
 	if parsedURL.Scheme == "unix" {
 		// For Unix sockets, we need to use a custom transport
 		socketPath := parsedURL.Path
-		transport := &http.Transport{
+		transport = &http.Transport{
 			DialContext: func(ctx context.Context, proto, addr string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 			},
 		}
-		
-		// Apply authentication if credentials are provided
-		if username != "" && password != "" {
-			return &authenticatedTransport{
-				Transport: transport,
-				Username:  username,
-				Password:  password,
-			}, "http://localhost/RPC2", nil
-		}
-		
 		// Return a fake HTTP URL for the xmlrpc client, the transport will handle the actual connection
-		return transport, "http://localhost/RPC2", nil
+		clientURL = "http://localhost/RPC2"
+	} else {
+		// For HTTP/HTTPS, use a default transport clone
+		transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
 
-	// For HTTP/HTTPS, use default transport with authentication if provided
+	// Apply authentication if credentials are provided
 	if username != "" && password != "" {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		return &authenticatedTransport{
+		transport = &authenticatedTransport{
 			Transport: transport,
 			Username:  username,
 			Password:  password,
-		}, targetURL, nil
+		}
 	}
 
-	return nil, targetURL, nil
+	// Bound the whole request/response cycle so a hung or slow Supervisord
+	// can't block a scrape indefinitely.
+	return &timeoutTransport{Transport: transport, Timeout: rpcTimeout}, clientURL, nil
 }
 
 // authenticatedTransport wraps http.RoundTripper to add Basic Authentication
@@ -118,7 +150,20 @@ func (t *authenticatedTransport) RoundTrip(req *http.Request) (*http.Response, e
 	return t.Transport.RoundTrip(reqCopy)
 }
 
+// processKey uniquely identifies a process by its name and group. Using a
+// struct instead of concatenating the strings avoids collisions between
+// distinct (name, group) pairs (e.g. ("proc1", "A") vs ("proc", "1A")).
+type processKey struct {
+	name  string
+	group string
+}
+
 func fetchSupervisorProcessInfo() {
+	// Serialize scrapes: Reset() followed by repopulation is not atomic,
+	// so overlapping scrapes could otherwise observe empty/partial metrics.
+	fetchMu.Lock()
+	defer fetchMu.Unlock()
+
 	transport, clientURL, err := createTransport(supervisordURL)
 	if err != nil {
 		log.Printf("Error creating transport: %v", err)
@@ -150,14 +195,13 @@ func fetchSupervisorProcessInfo() {
 	supervisordUp.Set(1)
 
 	// Create a map to store the latest process information for each unique combination of name and group
-	latestInfo := make(map[string]map[string]interface{})
+	latestInfo := make(map[processKey]map[string]interface{})
 
 	for _, data := range result {
 		name, _ := data["name"].(string)
 		group, _ := data["group"].(string)
 
-		// Generate a unique key for the combination of name and group
-		key := name + group
+		key := processKey{name: name, group: group}
 
 		// Check if the latest information for this combination already exists
 		if existing, ok := latestInfo[key]; ok {
@@ -183,7 +227,8 @@ func fetchSupervisorProcessInfo() {
 		name, _ := data["name"].(string)
 		group, _ := data["group"].(string)
 		state, _ := data["statename"].(string)
-		exitStatus, _ := data["exitstatus"].(int)
+		// kolo/xmlrpc decodes XML-RPC <int> values into interface{} as int64, not int.
+		exitStatus, _ := data["exitstatus"].(int64)
 		startTime, _ := data["start"].(int64)
 
 		value := 0
@@ -207,6 +252,17 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	flag.Parse()
+
+	// Prefer environment variables for credentials over CLI flags, which are
+	// visible to other local users via the process list (e.g. `ps aux`).
+	if v := os.Getenv("SUPERVISORD_USERNAME"); v != "" {
+		username = v
+	}
+	if v := os.Getenv("SUPERVISORD_PASSWORD"); v != "" {
+		password = v
+	}
+
 	if version {
 		fmt.Printf("Supervisor Exporter v%v\n", appVersion)
 		os.Exit(0)

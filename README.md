@@ -90,7 +90,7 @@ Once you have configured and verified the XML-RPC endpoint on Supervisord, you c
 1. Clone the repository:
 
    ```shell
-   git clone https://github.com/salimd/supervisord_exporter.git
+   git clone https://github.com/123-soleil/supervisord_exporter.git
    ```
 
 2. Build the application:
@@ -115,8 +115,9 @@ The Supervisord Exporter can be configured using command line parameters. Here a
 * `-supervisord-url`: The URL of the Supervisord XML-RPC interface. Supports both HTTP and Unix socket schemes. Default is `http://localhost:9001/RPC2`
   * HTTP example: `http://localhost:9001/RPC2`
   * Unix socket example: `unix:///run/supervisord/supervisor.sock`
-* `-username`: Username for Supervisord authentication (optional)
-* `-password`: Password for Supervisord authentication (optional)
+* `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list.
+* `-password`: Password for Supervisord authentication (optional). Prefer the `SUPERVISORD_PASSWORD` environment variable, since CLI flags are visible to other local users via the process list.
+* `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`
 * `-web.listen-address`: The address and port where the exporter will listen for HTTP requests. Default is `:9876`
 * `-web.telemetry-path`: Path under which to expose metrics. Default is `/metrics`
 * `-version`: Print the version information and exit.
@@ -136,6 +137,11 @@ Examples of custom configurations:
 **Unix socket without authentication:**
 ```shell
 ./supervisord_exporter -supervisord-url="unix:///var/run/supervisor.sock"
+```
+
+**Credentials via environment variables (recommended):**
+```shell
+SUPERVISORD_USERNAME="dummy" SUPERVISORD_PASSWORD="dummy" ./supervisord_exporter -supervisord-url="http://example.com:9001/RPC2"
 ```
 
 ### Prometheus Metrics
