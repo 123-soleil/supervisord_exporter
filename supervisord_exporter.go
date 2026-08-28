@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/kolo/xmlrpc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -26,42 +28,64 @@ var (
 	password       string
 	rpcTimeout     time.Duration
 	version        bool
-	appVersion     float32 = 0.1
+	appVersion     = "0.1"
 
-	// fetchMu and fetchInFlight coalesce concurrent scrapes into a single in-flight
-	// fetch: instead of queuing N scrapes behind each other (each taking up to
-	// rpcTimeout), all callers that arrive while a fetch is running simply wait for
-	// that one fetch to finish and reuse its result.
-	fetchMu       sync.Mutex
-	fetchInFlight chan struct{}
-
-	// rpcTransport and rpcClientURL are built once at startup from the (static)
+	// rpcTransport and rpcClient are built once at startup from the (static)
 	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
-	// across scrapes so each scrape doesn't pay a fresh connection handshake.
+	// across scrapes: this avoids paying a fresh connection handshake and
+	// xmlrpc.Client setup on every scrape. rpc.Client (which xmlrpc.Client wraps)
+	// is safe to reuse for repeated sequential calls.
 	rpcTransport http.RoundTripper
 	rpcClientURL string
+	rpcClient    *xmlrpc.Client
 
-	processesMetric = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "supervisor_process_info",
-			Help: "Supervisor process information",
-		},
+	// fetchGroup coalesces concurrent scrapes into a single in-flight fetch:
+	// instead of every scrape performing its own XML-RPC round trip (each taking
+	// up to rpcTimeout), callers that arrive while a fetch is running wait for
+	// that one fetch and share its result.
+	fetchGroup singleflight.Group
+
+	processInfoDesc = prometheus.NewDesc(
+		"supervisor_process_info",
+		"Supervisor process information",
 		[]string{"name", "group", "state", "exit_status"},
+		nil,
 	)
-	supervisorProcessUptime = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "supervisor_process_uptime",
-			Help: "Uptime of Supervisor processes",
-		},
+	processUptimeDesc = prometheus.NewDesc(
+		"supervisor_process_uptime",
+		"Uptime of Supervisor processes",
 		[]string{"name", "group"},
+		nil,
 	)
-	supervisordUp = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "supervisord_up",
-			Help: "Supervisord XML-RPC connection status (1 if up, 0 if down)",
-		},
+	supervisordUpDesc = prometheus.NewDesc(
+		"supervisord_up",
+		"Supervisord XML-RPC connection status (1 if up, 0 if down)",
+		nil,
+		nil,
 	)
+
+	// snapshotMu guards currentSnapshot. A scrape publishes a brand new *snapshot
+	// built entirely off to the side and only then swaps the pointer in, so a
+	// concurrent Collect() always sees either the previous fully-formed snapshot
+	// or the new one — never a partially-populated one.
+	snapshotMu      sync.RWMutex
+	currentSnapshot = &snapshot{}
 )
+
+// processSample is one process's data as published to Prometheus.
+type processSample struct {
+	name, group, state string
+	exitStatus         int64
+	running            bool
+	uptimeSeconds      float64
+	hasUptime          bool
+}
+
+// snapshot is the full, self-consistent set of data for one scrape.
+type snapshot struct {
+	up        float64
+	processes []processSample
+}
 
 func init() {
 	flag.StringVar(&supervisordURL, "supervisord-url", "http://localhost:9001/RPC2", "Supervisord XML-RPC URL (supports http:// and unix:// schemes)")
@@ -72,9 +96,44 @@ func init() {
 	flag.DurationVar(&rpcTimeout, "supervisord-timeout", 10*time.Second, "Timeout for XML-RPC requests to Supervisord")
 	flag.BoolVar(&version, "version", false, "Displays application version")
 
-	prometheus.MustRegister(processesMetric)
-	prometheus.MustRegister(supervisorProcessUptime)
-	prometheus.MustRegister(supervisordUp)
+	prometheus.MustRegister(supervisorCollector{})
+}
+
+// supervisorCollector implements prometheus.Collector by serving the latest
+// atomically-swapped snapshot. Unlike mutating a registered GaugeVec via
+// Reset()+repopulate, this can never expose a torn/partial update to a
+// concurrent scrape.
+type supervisorCollector struct{}
+
+func (supervisorCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- processInfoDesc
+	ch <- processUptimeDesc
+	ch <- supervisordUpDesc
+}
+
+func (supervisorCollector) Collect(ch chan<- prometheus.Metric) {
+	snapshotMu.RLock()
+	snap := currentSnapshot
+	snapshotMu.RUnlock()
+
+	ch <- prometheus.MustNewConstMetric(supervisordUpDesc, prometheus.GaugeValue, snap.up)
+
+	for _, p := range snap.processes {
+		value := 0.0
+		if p.running {
+			value = 1
+		}
+		ch <- prometheus.MustNewConstMetric(processInfoDesc, prometheus.GaugeValue, value, p.name, p.group, p.state, strconv.FormatInt(p.exitStatus, 10))
+		if p.running && p.hasUptime {
+			ch <- prometheus.MustNewConstMetric(processUptimeDesc, prometheus.GaugeValue, p.uptimeSeconds, p.name, p.group)
+		}
+	}
+}
+
+func publishSnapshot(snap *snapshot) {
+	snapshotMu.Lock()
+	currentSnapshot = snap
+	snapshotMu.Unlock()
 }
 
 // timeoutTransport bounds the total time spent reading a request's headers and body,
@@ -109,8 +168,10 @@ func (b *cancelOnCloseBody) Close() error {
 }
 
 // createTransport creates an HTTP transport that supports both HTTP and Unix socket connections.
-// It is called once at startup; the returned transport is reused across scrapes so repeated
-// scrapes benefit from connection reuse instead of paying a fresh handshake every time.
+// It is called once at startup; the returned transport (and the *xmlrpc.Client built on top of
+// it) is reused across scrapes so repeated scrapes benefit from connection reuse instead of
+// paying a fresh handshake every time. Its connections live for the process's lifetime — there's
+// no explicit idle-connection cleanup because there's nothing to clean up until the process exits.
 func createTransport(targetURL string) (http.RoundTripper, string, error) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
@@ -180,51 +241,24 @@ type processKey struct {
 	group string
 }
 
-// refreshMetrics coalesces concurrent scrapes: Reset() followed by repopulation is not
-// atomic, so serializing scrapes behind a plain mutex would let them queue up one after
-// another, each taking up to rpcTimeout — an unbounded worst case under load. Instead,
-// only one fetch runs at a time; anyone arriving while it's in flight just waits for it
-// and reuses its result, bounding worst-case latency to a single rpcTimeout.
+// refreshMetrics fetches the latest process info from Supervisord and publishes it, coalescing
+// concurrent scrapes via fetchGroup so they share a single fetch instead of each performing their
+// own. singleflight.Group also guarantees that a panic inside the fetch propagates to every
+// waiting caller instead of leaving the group permanently stuck.
 func refreshMetrics() {
-	fetchMu.Lock()
-	if ch := fetchInFlight; ch != nil {
-		fetchMu.Unlock()
-		<-ch
-		return
-	}
-	ch := make(chan struct{})
-	fetchInFlight = ch
-	fetchMu.Unlock()
-
-	fetchSupervisorProcessInfo()
-
-	fetchMu.Lock()
-	fetchInFlight = nil
-	fetchMu.Unlock()
-	close(ch)
+	fetchGroup.Do("fetch", func() (interface{}, error) {
+		fetchSupervisorProcessInfo()
+		return nil, nil
+	})
 }
 
 func fetchSupervisorProcessInfo() {
-	client, err := xmlrpc.NewClient(rpcClientURL, rpcTransport)
-	if err != nil {
-		log.Printf("Error creating Supervisor XML-RPC client: %v", err)
-		supervisordUp.Set(0)
-		processesMetric.Reset()
-		supervisorProcessUptime.Reset()
-		return
-	}
-	defer client.Close()
-
 	result := []map[string]interface{}{}
-	if err := client.Call("supervisor.getAllProcessInfo", nil, &result); err != nil {
+	if err := rpcClient.Call("supervisor.getAllProcessInfo", nil, &result); err != nil {
 		log.Printf("Error calling Supervisor XML-RPC method: %v", err)
-		supervisordUp.Set(0)
-		processesMetric.Reset()
-		supervisorProcessUptime.Reset()
+		publishSnapshot(&snapshot{})
 		return
 	}
-
-	supervisordUp.Set(1)
 
 	// Create a map to store the latest process information for each unique combination of name and group
 	latestInfo := make(map[processKey]map[string]interface{})
@@ -235,25 +269,27 @@ func fetchSupervisorProcessInfo() {
 
 		key := processKey{name: name, group: group}
 
-		// Check if the latest information for this combination already exists
-		if existing, ok := latestInfo[key]; ok {
-			// Compare timestamps to determine which information is more recent
-			existingStartTime, _ := existing["start"].(int64)
-			newStartTime, _ := data["start"].(int64)
-
-			// If the new information is more recent, update the latestInfo map
-			if newStartTime > existingStartTime {
-				latestInfo[key] = data
-			}
-		} else {
-			// If no previous information exists for this combination, add it to the map
+		existing, ok := latestInfo[key]
+		if !ok {
 			latestInfo[key] = data
+			continue
+		}
+
+		// Compare timestamps to determine which information is more recent
+		existingStartTime, existingOk := existing["start"].(int64)
+		newStartTime, newOk := data["start"].(int64)
+
+		switch {
+		case newOk && (!existingOk || newStartTime > existingStartTime):
+			latestInfo[key] = data
+		case existingOk && newOk && newStartTime == existingStartTime:
+			log.Printf("Warning: duplicate process entries for %s/%s share the same start time; keeping the first one encountered", name, group)
+		case !existingOk && !newOk:
+			log.Printf("Warning: duplicate process entries for %s/%s have no valid start time; keeping the first one encountered", name, group)
 		}
 	}
 
-	// Clear the previous metric values
-	processesMetric.Reset()
-	supervisorProcessUptime.Reset()
+	processes := make([]processSample, 0, len(latestInfo))
 
 	for _, data := range latestInfo {
 		name, _ := data["name"].(string)
@@ -263,23 +299,27 @@ func fetchSupervisorProcessInfo() {
 		exitStatus, _ := data["exitstatus"].(int64)
 		startTime, startTimeOk := data["start"].(int64)
 
-		value := 0
-		if state == "RUNNING" {
-			value = 1
+		sample := processSample{
+			name:       name,
+			group:      group,
+			state:      state,
+			exitStatus: exitStatus,
+			running:    state == "RUNNING",
 		}
 
-		processesMetric.WithLabelValues(name, group, state, fmt.Sprintf("%d", exitStatus)).Set(float64(value))
-
-		// Calculate uptime and set the supervisor_process_uptime metric
-		if value == 1 {
+		if sample.running {
 			if startTimeOk {
-				uptime := time.Now().Unix() - startTime
-				supervisorProcessUptime.WithLabelValues(name, group).Set(float64(uptime))
+				sample.uptimeSeconds = float64(time.Now().Unix() - startTime)
+				sample.hasUptime = true
 			} else {
 				log.Printf("Warning: process %s/%s is RUNNING but has no valid start time; skipping uptime metric", name, group)
 			}
 		}
+
+		processes = append(processes, sample)
 	}
+
+	publishSnapshot(&snapshot{up: 1, processes: processes})
 }
 
 var promHandler = promhttp.Handler()
@@ -305,16 +345,21 @@ func main() {
 	}
 
 	if version {
-		fmt.Printf("Supervisor Exporter v%v\n", appVersion)
+		fmt.Printf("Supervisor Exporter v%s\n", appVersion)
 		os.Exit(0)
 	}
 
 	// Built once and reused for every scrape; supervisordURL/username/password/rpcTimeout
-	// are fixed after flag parsing, so there's no reason to rebuild the transport per request.
+	// are fixed after flag parsing, so there's no reason to rebuild these per request.
 	var err error
 	rpcTransport, rpcClientURL, err = createTransport(supervisordURL)
 	if err != nil {
 		fmt.Printf("Error: %s\n", err)
+		os.Exit(1)
+	}
+	rpcClient, err = xmlrpc.NewClient(rpcClientURL, rpcTransport)
+	if err != nil {
+		fmt.Printf("Error creating Supervisor XML-RPC client: %s\n", err)
 		os.Exit(1)
 	}
 

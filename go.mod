@@ -5,6 +5,7 @@ go 1.19
 require (
 	github.com/kolo/xmlrpc v0.0.0-20220921171641-a4b6fa1dd06b
 	github.com/prometheus/client_golang v1.17.0
+	golang.org/x/sync v0.5.0
 )
 
 require (
