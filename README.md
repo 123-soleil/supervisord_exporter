@@ -101,7 +101,7 @@ Requires Go 1.25 or newer (matching the `go` directive in `go.mod`). With an old
    go build
    ```
 
-### Usage
+## Usage
 
 To start the Supervisord Exporter, run the following command:
 
@@ -111,7 +111,7 @@ To start the Supervisord Exporter, run the following command:
 
 By default, the exporter will listen on port 9876 and use the Supervisor XML-RPC interface at `http://localhost:9001/RPC2`. You can change the defaults using command line parameters (see [Configuration](#configuration) section).
 
-### Configuration
+## Configuration
 
 The Supervisord Exporter can be configured using command line parameters. Here are the available parameters:
 
@@ -119,9 +119,9 @@ The Supervisord Exporter can be configured using command line parameters. Here a
   * HTTP example: `http://localhost:9001/RPC2`
   * HTTPS example (e.g. Supervisord behind a TLS-terminating reverse proxy): `https://supervisord.internal:9001/RPC2`
   * Unix socket example: `unix:///run/supervisord/supervisor.sock`.
-* `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list. If only one of username/password is set, authentication is silently disabled entirely (a warning is logged) — Supervisord is then scraped unauthenticated rather than the exporter failing to start.
+* `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list. If only one of username/password is set, authentication is silently disabled entirely (a warning is logged) — Supervisord is then scraped unauthenticated rather than the exporter failing to start. Note: with a plain `http://` `-supervisord-url` (the default), Basic Auth credentials are sent unencrypted on the wire on every scrape — preferring the env var over the CLI flag only protects against local process-list snooping, not network eavesdropping. Use `https://` (see `-supervisord-tls-ca-file` below) if that matters for your deployment.
 * `-password`: Password for Supervisord authentication (optional). Prefer the `SUPERVISORD_PASSWORD` environment variable, since CLI flags are visible to other local users via the process list.
-* `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`
+* `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`. Unlike `-stale-grace-period` below, `0` (or a negative value) is not a valid "no timeout" setting here — the exporter refuses to start if it's `<= 0`.
 * `-supervisord-tls-ca-file`: Path to a PEM CA bundle to trust when `-supervisord-url` uses `https://` with a certificate not signed by a system-trusted CA (e.g. a private/internal CA on a reverse proxy in front of Supervisord). If unset, only the system trust store is used, and an untrusted certificate makes every scrape fail with `supervisord_up 0`.
 * `-stale-grace-period`: How long to keep serving the last known process metrics (with `supervisord_up=0`) after Supervisord becomes unreachable, before clearing them as too stale to trust. Default is `1m`. This is only re-evaluated on each scrape, so set it well above your Prometheus `scrape_interval` — if it's shorter than (or close to) `scrape_interval`, the very first failed scrape may already exceed it and clear the metrics immediately, defeating the point. Set to `0` to disable the grace period (clear immediately on any failure).
 * `-web.listen-address`: The address and port where the exporter will listen for HTTP requests. Default is `:9876`
@@ -165,7 +165,7 @@ SUPERVISORD_USERNAME="dummy" SUPERVISORD_PASSWORD="dummy" ./supervisord_exporter
 ```
 Prometheus then needs a matching client certificate/key configured in its scrape config (`tls_config.cert_file`/`key_file`), signed by that same CA.
 
-### Prometheus Metrics
+## Prometheus Metrics
 
 The Supervisord Exporter exposes the following Prometheus metrics:
 
@@ -186,7 +186,7 @@ supervisor_last_successful_scrape_timestamp_seconds 1.700000000e+09
 ```
 `supervisor_last_successful_scrape_timestamp_seconds` is only present after the first successful scrape — it's entirely absent from the output before that, not zero.
 
-### License
+## License
 
 This project is licensed under the MIT License
 

@@ -311,6 +311,11 @@ func TestMetrics_UnixSocket(t *testing.T) {
 	// AF_UNIX's sun_path limit (~104-108 bytes). os.TempDir() directly plus a
 	// short, unique filename keeps this portable.
 	sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("se_test_%d.sock", os.Getpid()))
+	// Remove any stale socket file a prior run left behind (e.g. hard-killed by
+	// a CI timeout before its own t.Cleanup ran) — net.Listen fails outright if
+	// a file already exists at the target path, even an unrelated leftover one
+	// from a PID that happens to be reused.
+	os.Remove(sockPath)
 	t.Cleanup(func() { os.Remove(sockPath) })
 	body := buildGetAllProcessInfoXML([]fakeProcess{
 		{Name: "runner", Group: "g", State: "RUNNING", ExitStatus: 0, Start: 1700000000},
@@ -497,6 +502,23 @@ func TestInvalidConfigFailsFast(t *testing.T) {
 	}
 }
 
+func TestInvalidConfig_RedactsCredentialsInErrorMessage(t *testing.T) {
+	// A malformed URL (missing host between "@" and ":9001") that still embeds
+	// Basic Auth credentials in userinfo form. createTransport rejects it for
+	// the missing host, but must not echo the password back in its error.
+	cmd := exec.Command(binPath,
+		"-web.listen-address=127.0.0.1:0",
+		"-supervisord-url=https://user:s3cr3t@:9001/RPC2",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected a non-zero exit, but the exporter started successfully. output:\n%s", out)
+	}
+	assertContains(t, string(out), "missing host")
+	assertNotContains(t, string(out), "s3cr3t")
+	assertContains(t, string(out), "REDACTED")
+}
+
 // --- helpers: ephemeral PKI for TLS/mTLS tests ---
 
 type testPKI struct {
@@ -618,9 +640,13 @@ func TestMetrics_SupervisordHTTPSWithCustomCA(t *testing.T) {
 	ep := startExporter(t,
 		"-supervisord-url="+srv.URL+"/RPC2",
 		"-supervisord-tls-ca-file="+caPath,
+		// Explicit and comfortably below the test's own client timeout below, so
+		// a slow-but-successful scrape on a loaded CI runner can't make the
+		// test's HTTP client time out for a reason unrelated to CA trust.
+		"-supervisord-timeout=3s",
 	)
-	client := &http.Client{Timeout: 5 * time.Second}
-	ep.waitReady(t, "http", client, 5*time.Second)
+	client := &http.Client{Timeout: 8 * time.Second}
+	ep.waitReady(t, "http", client, 8*time.Second)
 
 	out := ep.metrics(t, "http", client)
 	assertContains(t, out, "supervisord_up 1")
@@ -642,9 +668,9 @@ func TestMetrics_SupervisordHTTPSWithoutTrustedCAFails(t *testing.T) {
 
 	// No -supervisord-tls-ca-file: the self-signed cert isn't in the system
 	// trust store, so every scrape must fail rather than silently succeed.
-	ep := startExporter(t, "-supervisord-url="+srv.URL+"/RPC2", "-supervisord-timeout=2s")
-	client := &http.Client{Timeout: 5 * time.Second}
-	ep.waitReady(t, "http", client, 5*time.Second)
+	ep := startExporter(t, "-supervisord-url="+srv.URL+"/RPC2", "-supervisord-timeout=3s")
+	client := &http.Client{Timeout: 8 * time.Second}
+	ep.waitReady(t, "http", client, 8*time.Second)
 
 	out := ep.metrics(t, "http", client)
 	assertContains(t, out, "supervisord_up 0")

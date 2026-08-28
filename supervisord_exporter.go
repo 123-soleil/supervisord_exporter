@@ -273,11 +273,40 @@ func authPartiallyConfigured() bool {
 	return (username != "") != (password != "")
 }
 
+// redactURLForLogging returns targetURL with any embedded userinfo
+// (user:password@) replaced, so a malformed -supervisord-url containing
+// credentials (e.g. "https://user:s3cr3t@:9001/RPC2") can still be echoed in
+// an error message without leaking the password to logs/stderr. Falls back to
+// the raw string if it doesn't parse as a URL at all.
+func redactURLForLogging(targetURL string) string {
+	u, err := url.Parse(targetURL)
+	if err != nil || u.User == nil {
+		return targetURL
+	}
+	u.User = url.UserPassword("REDACTED", "REDACTED")
+	return u.String()
+}
+
+// loadCAPool reads a PEM CA bundle from path and returns it as a cert pool,
+// wrapping errors with flagName so the caller doesn't need to repeat it.
+func loadCAPool(path, flagName string) (*x509.CertPool, error) {
+	caPEM, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %v", flagName, err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("%s %q contains no valid PEM certificates", flagName, path)
+	}
+	return caPool, nil
+}
+
 func createTransport(targetURL string) (http.RoundTripper, string, error) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to parse URL: %v", err)
 	}
+	safeURL := redactURLForLogging(targetURL)
 
 	// Cloned once here (rather than duplicated in each scheme branch below) for
 	// its tuned defaults — MaxIdleConns, IdleConnTimeout, etc. — which the unix
@@ -292,16 +321,19 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		// puts the first path segment into Host instead, which would dial the
 		// wrong socket without any error.
 		if parsedURL.Host != "" {
-			return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", targetURL)
+			return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", safeURL)
 		}
 		if parsedURL.Path == "" {
 			if parsedURL.Opaque != "" {
 				// e.g. "unix:var/run/x.sock" (no "//"): url.Parse puts the given
 				// path in Opaque instead of Path, so point at the actual fix
 				// rather than claiming no path was given at all.
-				return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///%s (three slashes)", targetURL, parsedURL.Opaque)
+				return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///%s (three slashes)", safeURL, parsedURL.Opaque)
 			}
-			return nil, "", fmt.Errorf("invalid unix socket URL %q: missing socket path", targetURL)
+			return nil, "", fmt.Errorf("invalid unix socket URL %q: missing socket path", safeURL)
+		}
+		if supervisordTLSCAFile != "" {
+			log.Printf("Warning: -supervisord-tls-ca-file has no effect because -supervisord-url uses the unix:// scheme")
 		}
 		socketPath := parsedURL.Path
 		baseTransport.DialContext = func(ctx context.Context, proto, addr string) (net.Conn, error) {
@@ -314,25 +346,25 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		// plausible typo for "http://localhost:9001/RPC2" — is caught too: Host
 		// would be ":9001" (non-empty) there, while Hostname() is correctly "".
 		if parsedURL.Hostname() == "" {
-			return nil, "", fmt.Errorf("invalid -supervisord-url %q: missing host", targetURL)
+			return nil, "", fmt.Errorf("invalid -supervisord-url %q: missing host", safeURL)
 		}
 		if supervisordTLSCAFile != "" {
-			caPEM, err := os.ReadFile(supervisordTLSCAFile)
-			if err != nil {
-				return nil, "", fmt.Errorf("reading -supervisord-tls-ca-file: %v", err)
+			if parsedURL.Scheme != "https" {
+				log.Printf("Warning: -supervisord-tls-ca-file has no effect because -supervisord-url uses %q, not https", parsedURL.Scheme)
+			} else {
+				caPool, err := loadCAPool(supervisordTLSCAFile, "-supervisord-tls-ca-file")
+				if err != nil {
+					return nil, "", err
+				}
+				baseTransport.TLSClientConfig = &tls.Config{RootCAs: caPool}
 			}
-			caPool := x509.NewCertPool()
-			if !caPool.AppendCertsFromPEM(caPEM) {
-				return nil, "", fmt.Errorf("-supervisord-tls-ca-file %q contains no valid PEM certificates", supervisordTLSCAFile)
-			}
-			baseTransport.TLSClientConfig = &tls.Config{RootCAs: caPool}
 		}
 	default:
 		// Including a missing/misparsed scheme from a typo like "localhost:9001/RPC2"
 		// (no "http://"), which url.Parse would otherwise silently accept as scheme
 		// "localhost" — rejected here rather than falling through to the HTTP path
 		// and only failing cryptically on the first scrape.
-		return nil, "", fmt.Errorf("invalid -supervisord-url %q: unsupported scheme %q (expected http, https, or unix)", targetURL, parsedURL.Scheme)
+		return nil, "", fmt.Errorf("invalid -supervisord-url %q: unsupported scheme %q (expected http, https, or unix)", safeURL, parsedURL.Scheme)
 	}
 
 	var transport http.RoundTripper = baseTransport
@@ -554,13 +586,9 @@ func main() {
 	if tlsEnabled {
 		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 		if webTLSClientCAFile != "" {
-			caPEM, err := os.ReadFile(webTLSClientCAFile)
+			caPool, err := loadCAPool(webTLSClientCAFile, "-web.tls-client-ca-file")
 			if err != nil {
-				log.Fatalf("Error reading -web.tls-client-ca-file: %v", err)
-			}
-			caPool := x509.NewCertPool()
-			if !caPool.AppendCertsFromPEM(caPEM) {
-				log.Fatalf("Error: -web.tls-client-ca-file %q contains no valid PEM certificates", webTLSClientCAFile)
+				log.Fatalf("Error: %v", err)
 			}
 			tlsConfig.ClientCAs = caPool
 			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
