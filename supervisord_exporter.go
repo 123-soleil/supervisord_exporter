@@ -29,7 +29,7 @@ var (
 	rpcTimeout       time.Duration
 	staleGracePeriod time.Duration
 	version          bool
-	appVersion       = "0.1"
+	appVersion       = "0.3"
 
 	// rpcTransport and rpcClientURL are built once at startup from the (static)
 	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
@@ -110,6 +110,15 @@ type snapshot struct {
 	// steps (NTP correction, VM suspend/resume) — only the exported metric below
 	// converts it to a wall-clock Unix timestamp, for external consumers.
 	lastSuccess time.Time
+	// staleCleared is an explicit "already cleared for staleness" flag, rather
+	// than inferring that state from processes == nil. It's true only once
+	// markDown has cleared processes after the grace period expired, and is
+	// always false again on the next successful fetch. Keeping it explicit means
+	// markDown's one-shot logging doesn't depend on fetchSupervisorProcessInfo
+	// happening to build processes via make(..., 0, n) (never nil, even when
+	// empty) — a future change to that construction couldn't silently make
+	// markDown think every post-outage failure is "never succeeded" again.
+	staleCleared bool
 }
 
 func init() {
@@ -174,19 +183,23 @@ func publishSnapshot(snap *snapshot) {
 func markDown() {
 	prev := currentSnapshot.Load()
 	processes := prev.processes
-	// The processes != nil guard makes this a one-time transition: once a sustained
-	// outage has already cleared the list, every later failed scrape sees processes
-	// already nil and skips straight past, instead of re-logging this warning (and
-	// redundantly re-nil'ing an already-nil list) on every single scrape for the
-	// rest of the outage. It also implies lastSuccess is set: processes only ever
-	// becomes non-nil via publishSnapshot's success path, which always pairs it
-	// with a fresh, non-zero lastSuccess in that same call — so there's no need
-	// to separately guard against a zero lastSuccess here.
-	if processes != nil && time.Since(prev.lastSuccess) > staleGracePeriod {
+	staleCleared := prev.staleCleared
+	// The staleCleared guard makes this a one-time transition: once a sustained
+	// outage has already cleared the list, every later failed scrape sees
+	// staleCleared already true and skips straight past, instead of re-logging
+	// this warning (and redundantly re-nil'ing an already-nil list) on every
+	// single scrape for the rest of the outage. The lastSuccess.IsZero() check
+	// is still needed here (unlike staleCleared, it isn't implied by anything
+	// else): without it, a Supervisord that has never once succeeded would tick
+	// over from a zero lastSuccess (year 1) as already "stale" on the very first
+	// failed scrape, logging a misleading "no successful scrape in over X"
+	// before there was ever a successful one to go stale.
+	if !staleCleared && !prev.lastSuccess.IsZero() && time.Since(prev.lastSuccess) > staleGracePeriod {
 		log.Printf("Warning: no successful Supervisord scrape in over %s (stale-grace-period); clearing previously reported process metrics", staleGracePeriod)
 		processes = nil
+		staleCleared = true
 	}
-	currentSnapshot.Store(&snapshot{up: 0, processes: processes, lastSuccess: prev.lastSuccess})
+	currentSnapshot.Store(&snapshot{up: 0, processes: processes, lastSuccess: prev.lastSuccess, staleCleared: staleCleared})
 }
 
 // timeoutTransport bounds the total time spent reading a request's headers and body,
@@ -225,6 +238,22 @@ func (b *cancelOnCloseBody) Close() error {
 // it) is reused across scrapes so repeated scrapes benefit from connection reuse instead of
 // paying a fresh handshake every time. Its connections live for the process's lifetime — there's
 // no explicit idle-connection cleanup because there's nothing to clean up until the process exits.
+// authConfigured reports whether both Supervisord credentials were provided.
+// It's the single source of truth for "is auth on" — createTransport uses it to
+// decide whether to wrap the transport, and it's paired with
+// authPartiallyConfigured below so the two conditions can't silently drift
+// apart from each other.
+func authConfigured() bool {
+	return username != "" && password != ""
+}
+
+// authPartiallyConfigured reports whether exactly one of username/password was
+// provided — almost certainly a misconfiguration, since authConfigured() is
+// then false and auth ends up silently disabled.
+func authPartiallyConfigured() bool {
+	return (username != "") != (password != "")
+}
+
 func createTransport(targetURL string) (http.RoundTripper, string, error) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
@@ -262,7 +291,10 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 		// Return a fake HTTP URL for the xmlrpc client, the transport will handle the actual connection
 		clientURL = "http://localhost/RPC2"
 	case "http", "https":
-		if parsedURL.Host == "" {
+		// Hostname() (not Host) so a port-only host like "http://:9001/RPC2" — a
+		// plausible typo for "http://localhost:9001/RPC2" — is caught too: Host
+		// would be ":9001" (non-empty) there, while Hostname() is correctly "".
+		if parsedURL.Hostname() == "" {
 			return nil, "", fmt.Errorf("invalid -supervisord-url %q: missing host", targetURL)
 		}
 	default:
@@ -276,7 +308,7 @@ func createTransport(targetURL string) (http.RoundTripper, string, error) {
 	var transport http.RoundTripper = baseTransport
 
 	// Apply authentication if credentials are provided
-	if username != "" && password != "" {
+	if authConfigured() {
 		transport = &authenticatedTransport{
 			Transport: transport,
 			Username:  username,
@@ -387,17 +419,18 @@ func fetchSupervisorProcessInfo() {
 
 	processes := make([]processSample, 0, len(latestInfo))
 
-	for _, data := range latestInfo {
-		name, _ := data["name"].(string)
-		group, _ := data["group"].(string)
+	for key, data := range latestInfo {
+		// key.name/key.group are already the validated, dedup-key values from the
+		// loop above — re-asserting data["name"]/data["group"] here would just
+		// repeat that same extraction a second time.
 		state, _ := data["statename"].(string)
 		// kolo/xmlrpc decodes XML-RPC <int> values into interface{} as int64, not int.
 		exitStatus, _ := data["exitstatus"].(int64)
 		startTime, startTimeOk := data["start"].(int64)
 
 		sample := processSample{
-			name:       name,
-			group:      group,
+			name:       key.name,
+			group:      key.group,
 			state:      state,
 			exitStatus: exitStatus,
 			running:    state == "RUNNING",
@@ -407,13 +440,13 @@ func fetchSupervisorProcessInfo() {
 			if startTimeOk {
 				uptime := now.Unix() - startTime
 				if uptime < 0 {
-					log.Printf("Warning: process %s/%s has a start time in the future (clock skew?); clamping uptime to 0", name, group)
+					log.Printf("Warning: process %s/%s has a start time in the future (clock skew?); clamping uptime to 0", key.name, key.group)
 					uptime = 0
 				}
 				sample.uptimeSeconds = float64(uptime)
 				sample.hasUptime = true
 			} else {
-				log.Printf("Warning: process %s/%s is RUNNING but has no valid start time; skipping uptime metric", name, group)
+				log.Printf("Warning: process %s/%s is RUNNING but has no valid start time; skipping uptime metric", key.name, key.group)
 			}
 		}
 
@@ -459,7 +492,7 @@ func main() {
 	if v := os.Getenv("SUPERVISORD_PASSWORD"); v != "" {
 		password = v
 	}
-	if (username != "") != (password != "") {
+	if authPartiallyConfigured() {
 		log.Printf("Warning: only one of username/password is set; Supervisord authentication will be disabled")
 	}
 
