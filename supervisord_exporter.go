@@ -40,6 +40,16 @@ var (
 	// underlying codec, and kolo/xmlrpc's reflective decoder can plausibly fail
 	// on a truncated or unexpected response — a long-lived, reused *xmlrpc.Client
 	// would then wedge the exporter (supervisord_up stuck at 0) until restart.
+	//
+	// IMPORTANT: rpcTransport's outermost concrete type must never be a bare
+	// *http.Transport. kolo/xmlrpc's per-fetch Client.Close() only calls
+	// CloseIdleConnections() when it can type-assert the transport straight to
+	// *http.Transport; since rpcTransport is always wrapped (at minimum in
+	// *timeoutTransport), that assertion never matches, Close() leaves the
+	// pool's connections alone, and they survive to be reused by the next
+	// fetch. Passing the raw *http.Transport to xmlrpc.NewClient instead would
+	// make that assertion succeed and silently defeat this connection reuse —
+	// every scrape would then pay a fresh handshake, with no error to reveal why.
 	rpcTransport http.RoundTripper
 	rpcClientURL string
 
@@ -327,13 +337,13 @@ func fetchSupervisorProcessInfo() {
 		existingStartTime, existingOk := existing["start"].(int64)
 		newStartTime, newOk := data["start"].(int64)
 
-		switch {
-		case newOk && (!existingOk || newStartTime > existingStartTime):
+		// Any case that isn't a clear "the new entry is more recent" replacement is
+		// logged here, whichever way the start times (or their absence) compare —
+		// so no combination of duplicate entries falls through silently.
+		if newOk && (!existingOk || newStartTime > existingStartTime) {
 			latestInfo[key] = data
-		case existingOk && newOk && newStartTime == existingStartTime:
-			log.Printf("Warning: duplicate process entries for %s/%s share the same start time; keeping the first one encountered", name, group)
-		case !existingOk && !newOk:
-			log.Printf("Warning: duplicate process entries for %s/%s have no valid start time; keeping the first one encountered", name, group)
+		} else {
+			log.Printf("Warning: duplicate process entries for %s/%s; keeping the one already seen", name, group)
 		}
 	}
 
@@ -399,6 +409,13 @@ func main() {
 
 	if staleGracePeriod < 0 {
 		log.Fatalf("Error: -stale-grace-period must be >= 0, got %s", staleGracePeriod)
+	}
+	if rpcTimeout <= 0 {
+		// Unlike -stale-grace-period, 0 has no sensible meaning here: a zero (or
+		// negative) context.WithTimeout deadline is already expired before the
+		// request is even sent, so every scrape would fail instantly with no
+		// indication why, and supervisord_up would be stuck at 0 permanently.
+		log.Fatalf("Error: -supervisord-timeout must be > 0, got %s", rpcTimeout)
 	}
 
 	// Prefer environment variables for credentials over CLI flags, which are
