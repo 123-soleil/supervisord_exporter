@@ -118,6 +118,7 @@ The Supervisord Exporter can be configured using command line parameters. Here a
 * `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list.
 * `-password`: Password for Supervisord authentication (optional). Prefer the `SUPERVISORD_PASSWORD` environment variable, since CLI flags are visible to other local users via the process list.
 * `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`
+* `-stale-grace-period`: How long to keep serving the last known process metrics (with `supervisord_up=0`) after Supervisord becomes unreachable, before clearing them as too stale to trust. Default is `1m`
 * `-web.listen-address`: The address and port where the exporter will listen for HTTP requests. Default is `:9876`
 * `-web.telemetry-path`: Path under which to expose metrics. Default is `/metrics`
 * `-version`: Print the version information and exit.
@@ -150,7 +151,10 @@ The Supervisord Exporter exposes the following Prometheus metrics:
 
 * `supervisor_process_info`: Gauge vector with labels for `name`, `group`, `state`, and `exit_status`. Value is `1` if the process is running (`state="RUNNING"`) and `0` otherwise. `exit_status` is `0` for a running process, and the process's actual exit code otherwise.
 * `supervisor_process_uptime`: Gauge vector with labels `name` and `group`, giving the uptime in seconds of a running process. Only exported for processes currently in the `RUNNING` state.
-* `supervisord_up`: Gauge metric indicating the status of the connection to Supervisord (1 if up, 0 if down). If the Supervisord XML-RPC endpoint is unreachable, this metric will be set to 0, and there will be no supervisor_process_info/supervisor_process_uptime metrics in the output.
+* `supervisord_up`: Gauge metric indicating the status of the connection to Supervisord (1 if up, 0 if down).
+* `supervisor_last_successful_scrape_timestamp_seconds`: Unix timestamp of the last successful Supervisord XML-RPC scrape. Use this to detect stale data independently of `supervisord_up`.
+
+If the Supervisord XML-RPC endpoint becomes unreachable, `supervisord_up` drops to 0 immediately, but `supervisor_process_info`/`supervisor_process_uptime` keep reporting the last known values for up to `-stale-grace-period` (default `1m`) so a brief hiccup doesn't make every process's metrics disappear. If the outage outlasts that grace period, those metrics are cleared, since serving arbitrarily old process/uptime data during a real outage would be misleading.
 
 
 Sample metric:

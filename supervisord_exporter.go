@@ -21,14 +21,15 @@ import (
 )
 
 var (
-	supervisordURL string
-	listenAddress  string
-	metricsPath    string
-	username       string
-	password       string
-	rpcTimeout     time.Duration
-	version        bool
-	appVersion     = "0.1"
+	supervisordURL   string
+	listenAddress    string
+	metricsPath      string
+	username         string
+	password         string
+	rpcTimeout       time.Duration
+	staleGracePeriod time.Duration
+	version          bool
+	appVersion       = "0.1"
 
 	// rpcTransport and rpcClientURL are built once at startup from the (static)
 	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
@@ -66,6 +67,12 @@ var (
 		nil,
 		nil,
 	)
+	lastSuccessDesc = prometheus.NewDesc(
+		"supervisor_last_successful_scrape_timestamp_seconds",
+		"Unix timestamp of the last successful Supervisord XML-RPC scrape",
+		nil,
+		nil,
+	)
 
 	// currentSnapshot is swapped atomically: a scrape builds a brand new *snapshot
 	// entirely off to the side and only then stores the pointer, so a concurrent
@@ -85,8 +92,9 @@ type processSample struct {
 
 // snapshot is the full, self-consistent set of data for one scrape.
 type snapshot struct {
-	up        float64
-	processes []processSample
+	up              float64
+	processes       []processSample
+	lastSuccessUnix int64 // 0 if there has never been a successful fetch
 }
 
 func init() {
@@ -96,6 +104,7 @@ func init() {
 	flag.StringVar(&username, "username", "", "Username for Supervisord authentication (prefer SUPERVISORD_USERNAME env var)")
 	flag.StringVar(&password, "password", "", "Password for Supervisord authentication (prefer SUPERVISORD_PASSWORD env var to avoid leaking it via process listings)")
 	flag.DurationVar(&rpcTimeout, "supervisord-timeout", 10*time.Second, "Timeout for XML-RPC requests to Supervisord")
+	flag.DurationVar(&staleGracePeriod, "stale-grace-period", time.Minute, "How long to keep serving the last known process metrics (with supervisord_up=0) after Supervisord becomes unreachable, before clearing them as too stale to trust")
 	flag.BoolVar(&version, "version", false, "Displays application version")
 
 	currentSnapshot.Store(&snapshot{})
@@ -112,12 +121,16 @@ func (supervisorCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- processInfoDesc
 	ch <- processUptimeDesc
 	ch <- supervisordUpDesc
+	ch <- lastSuccessDesc
 }
 
 func (supervisorCollector) Collect(ch chan<- prometheus.Metric) {
 	snap := currentSnapshot.Load()
 
 	ch <- prometheus.MustNewConstMetric(supervisordUpDesc, prometheus.GaugeValue, snap.up)
+	if snap.lastSuccessUnix != 0 {
+		ch <- prometheus.MustNewConstMetric(lastSuccessDesc, prometheus.GaugeValue, float64(snap.lastSuccessUnix))
+	}
 
 	for _, p := range snap.processes {
 		value := 0.0
@@ -135,12 +148,21 @@ func publishSnapshot(snap *snapshot) {
 	currentSnapshot.Store(snap)
 }
 
-// markDown flags the Supervisord connection as down while keeping the last known
-// process list, so a single transient RPC hiccup doesn't make every process's
-// metrics vanish for that scrape — only supervisord_up drops, exactly as before
-// the hiccup started, until a subsequent fetch succeeds or genuinely finds nothing.
+// markDown flags the Supervisord connection as down. It keeps serving the last known
+// process list for up to staleGracePeriod after the last successful fetch, so a brief
+// RPC hiccup doesn't make every process's metrics vanish for that scrape — only
+// supervisord_up drops. Once the outage outlasts the grace period, the process list is
+// cleared: serving arbitrarily old process/uptime data during a real, sustained outage
+// would be actively misleading (frozen uptimes, processes that may no longer exist).
+// supervisor_last_successful_scrape_timestamp_seconds lets consumers detect staleness
+// directly instead of having to remember to also check supervisord_up.
 func markDown() {
-	currentSnapshot.Store(&snapshot{up: 0, processes: currentSnapshot.Load().processes})
+	prev := currentSnapshot.Load()
+	processes := prev.processes
+	if prev.lastSuccessUnix != 0 && time.Since(time.Unix(prev.lastSuccessUnix, 0)) > staleGracePeriod {
+		processes = nil
+	}
+	currentSnapshot.Store(&snapshot{up: 0, processes: processes, lastSuccessUnix: prev.lastSuccessUnix})
 }
 
 // timeoutTransport bounds the total time spent reading a request's headers and body,
@@ -339,7 +361,7 @@ func fetchSupervisorProcessInfo() {
 		processes = append(processes, sample)
 	}
 
-	publishSnapshot(&snapshot{up: 1, processes: processes})
+	publishSnapshot(&snapshot{up: 1, processes: processes, lastSuccessUnix: time.Now().Unix()})
 }
 
 var promHandler = promhttp.Handler()
