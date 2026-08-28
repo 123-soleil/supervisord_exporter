@@ -6,5 +6,6 @@ COPY . .
 RUN CGO_ENABLED=0 go test ./...
 RUN CGO_ENABLED=0 go build .
 FROM alpine
+RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/supervisord_exporter /usr/bin/supervisord_exporter
 ENTRYPOINT ["/usr/bin/supervisord_exporter"]

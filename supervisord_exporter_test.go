@@ -18,10 +18,34 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a concurrency-safe bytes.Buffer. It's needed because
+// exporterProc points both cmd.Stdout and cmd.Stderr at the same buffer:
+// os/exec copies each stream on its own goroutine, so without locking, two
+// writes (stdout vs stderr) — or a test reading via String() while either is
+// still writing — would race on a plain bytes.Buffer, which isn't safe for
+// concurrent use.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // binPath is the path to the exporter binary built once in TestMain, so every
 // test below exercises the actual compiled artifact (a post-build/integration
@@ -34,7 +58,8 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "failed to create temp dir:", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(tmpDir)
+	// Note: os.Exit below skips defers, so tmpDir is removed explicitly on every
+	// exit path instead of via `defer os.RemoveAll(tmpDir)`.
 
 	binPath = filepath.Join(tmpDir, "supervisord_exporter")
 	cmd := exec.Command("go", "build", "-o", binPath, ".")
@@ -42,10 +67,13 @@ func TestMain(m *testing.M) {
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "failed to build exporter binary:", err)
+		os.RemoveAll(tmpDir)
 		os.Exit(1)
 	}
 
-	os.Exit(m.Run())
+	code := m.Run()
+	os.RemoveAll(tmpDir)
+	os.Exit(code)
 }
 
 // --- helpers: fake Supervisord XML-RPC server ---
@@ -103,7 +131,7 @@ func staticBody(body []byte) func() ([]byte, int) {
 type exporterProc struct {
 	cmd    *exec.Cmd
 	addr   string
-	stderr *bytes.Buffer
+	stderr *syncBuffer
 }
 
 // freeAddr reserves a free TCP port by binding then immediately releasing it.
@@ -129,14 +157,14 @@ func startExporter(t *testing.T, extraArgs ...string) *exporterProc {
 	args := append([]string{"-web.listen-address=" + listenAddr}, extraArgs...)
 
 	cmd := exec.Command(binPath, args...)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out := &syncBuffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed to start exporter: %v", err)
 	}
 
-	ep := &exporterProc{cmd: cmd, addr: listenAddr, stderr: &out}
+	ep := &exporterProc{cmd: cmd, addr: listenAddr, stderr: out}
 	t.Cleanup(func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
@@ -223,6 +251,59 @@ func TestMetrics_RunningAndExitedProcess(t *testing.T) {
 	assertNotContains(t, out, `supervisor_process_uptime{group="mygroup",name="myproc"}`)
 }
 
+func TestMetrics_DuplicateProcessEntries_Dedup(t *testing.T) {
+	body := buildGetAllProcessInfoXML([]fakeProcess{
+		// Same (name, group): the later start time should win over the earlier one.
+		{Name: "dup", Group: "dupgroup", State: "STOPPED", ExitStatus: 1, Start: 1000},
+		{Name: "dup", Group: "dupgroup", State: "RUNNING", ExitStatus: 0, Start: 2000},
+		// Same (name, group), identical start times: an ambiguous duplicate that
+		// should log a warning and keep the first one seen.
+		{Name: "tie", Group: "tiegroup", State: "RUNNING", ExitStatus: 0, Start: 5000},
+		{Name: "tie", Group: "tiegroup", State: "RUNNING", ExitStatus: 0, Start: 5000},
+		// Same (name, group), neither with a valid start time: also ambiguous.
+		{Name: "nostart", Group: "nostartgroup", State: "STOPPED", ExitStatus: 0, OmitStart: true},
+		{Name: "nostart", Group: "nostartgroup", State: "STOPPED", ExitStatus: 0, OmitStart: true},
+	})
+	supervisord := fakeSupervisord(t, staticBody(body))
+
+	ep := startExporter(t, "-supervisord-url="+supervisord.URL+"/RPC2")
+	client := &http.Client{Timeout: 5 * time.Second}
+	ep.waitReady(t, "http", client, 5*time.Second)
+
+	out := ep.metrics(t, "http", client)
+
+	// Exactly one series per duplicated (name, group) pair — the "losing" entry
+	// must not also show up.
+	assertContains(t, out, `supervisor_process_info{exit_status="0",group="dupgroup",name="dup",state="RUNNING"} 1`)
+	assertNotContains(t, out, `group="dupgroup",name="dup",state="STOPPED"`)
+	assertContains(t, out, `supervisor_process_info{exit_status="0",group="tiegroup",name="tie",state="RUNNING"} 1`)
+	assertContains(t, out, `supervisor_process_info{exit_status="0",group="nostartgroup",name="nostart",state="STOPPED"} 0`)
+
+	// The two ambiguous-duplicate cases should each have logged their own
+	// specific warning, not just been silently resolved.
+	logs := ep.stderr.String()
+	assertContains(t, logs, "share the same start time")
+	assertContains(t, logs, "have no valid start time")
+}
+
+func TestMetrics_RunningProcessMissingStartTime(t *testing.T) {
+	body := buildGetAllProcessInfoXML([]fakeProcess{
+		{Name: "nostartrunner", Group: "g", State: "RUNNING", ExitStatus: 0, OmitStart: true},
+	})
+	supervisord := fakeSupervisord(t, staticBody(body))
+
+	ep := startExporter(t, "-supervisord-url="+supervisord.URL+"/RPC2")
+	client := &http.Client{Timeout: 5 * time.Second}
+	ep.waitReady(t, "http", client, 5*time.Second)
+
+	out := ep.metrics(t, "http", client)
+	assertContains(t, out, `supervisor_process_info{exit_status="0",group="g",name="nostartrunner",state="RUNNING"} 1`)
+	// No start time means no uptime can be computed — the series must be absent
+	// entirely, not a bogus value like 0 or a huge number.
+	assertNotContains(t, out, `supervisor_process_uptime{group="g",name="nostartrunner"}`)
+	assertContains(t, ep.stderr.String(), "is RUNNING but has no valid start time")
+}
+
 func TestMetrics_SupervisordUnreachable(t *testing.T) {
 	closedAddr := freeAddr(t) // nothing listens here
 
@@ -253,7 +334,10 @@ func TestMetrics_StaleGracePeriod_RetainThenClear(t *testing.T) {
 	ep := startExporter(t,
 		"-supervisord-url="+supervisord.URL+"/RPC2",
 		"-supervisord-timeout=1s",
-		"-stale-grace-period=1s",
+		// Generous relative to the check-immediately-after-down assertion below,
+		// so scheduling/HTTP round-trip latency on a slow/loaded CI runner can't
+		// make the grace period spuriously appear to have already elapsed.
+		"-stale-grace-period=3s",
 	)
 	client := &http.Client{Timeout: 5 * time.Second}
 	ep.waitReady(t, "http", client, 5*time.Second)
@@ -272,7 +356,7 @@ func TestMetrics_StaleGracePeriod_RetainThenClear(t *testing.T) {
 	assertContains(t, out, `supervisor_process_info{exit_status="0",group="rungroup",name="runner",state="RUNNING"} 1`)
 
 	// After the grace period elapses, the stale process metrics get cleared.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		out = ep.metrics(t, "http", client)
 		if !strings.Contains(out, "supervisor_process_info{") {
@@ -473,26 +557,12 @@ func TestMTLS_RequiresValidClientCert(t *testing.T) {
 	caPool := x509.NewCertPool()
 	caPool.AppendCertsFromPEM(pki.caCertPEM)
 
-	// Without a client certificate, the TLS handshake itself should fail.
-	noCertClient := &http.Client{
-		Timeout:   3 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caPool}},
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		_, err := noCertClient.Get(ep.url("https"))
-		if err != nil {
-			lastErr = err
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if lastErr == nil {
-		t.Fatalf("expected a request without a client certificate to be rejected by mTLS, but it succeeded")
-	}
-
-	// With a valid client certificate signed by the same CA, it should succeed.
+	// Establish (and wait for) a working mTLS connection first, using a valid
+	// client certificate. This confirms the server is actually up and accepting
+	// TLS before we test rejection below — otherwise a "no client cert" request
+	// failing merely because the listener isn't up yet would be indistinguishable
+	// from an actual mTLS rejection, and the test could pass without ever
+	// exercising the rejection path it claims to verify.
 	clientCert, err := tls.X509KeyPair(pki.clientCertPEM, pki.clientKeyPEM)
 	if err != nil {
 		t.Fatalf("loading client keypair: %v", err)
@@ -505,6 +575,19 @@ func TestMTLS_RequiresValidClientCert(t *testing.T) {
 		}},
 	}
 	ep.waitReady(t, "https", withCertClient, 5*time.Second)
+
+	// Now that the server is confirmed up and accepting valid mTLS connections,
+	// a request without a client certificate must be rejected because of mTLS,
+	// not because the server isn't listening yet.
+	noCertClient := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caPool}},
+	}
+	if resp, err := noCertClient.Get(ep.url("https")); err == nil {
+		resp.Body.Close()
+		t.Fatalf("expected a request without a client certificate to be rejected by mTLS, but it succeeded")
+	}
+
 	out := ep.metrics(t, "https", withCertClient)
 	assertContains(t, out, "supervisord_up")
 }

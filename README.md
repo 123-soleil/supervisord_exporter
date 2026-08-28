@@ -22,6 +22,7 @@ The Supervisor Exporter is a simple Go application that collects process status 
 - Handles unreachable Supervisord XML-RPC endpoints gracefully.
 - Supports both HTTP and Unix socket connections to Supervisord.
 - Supports authentication with username and password.
+- Can serve `/metrics` over HTTPS, optionally with mutual TLS (mTLS) client certificate verification.
 
 ## Getting Started
 
