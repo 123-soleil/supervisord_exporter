@@ -28,7 +28,18 @@ var (
 	version        bool
 	appVersion     float32 = 0.1
 
-	fetchMu sync.Mutex
+	// fetchMu and fetchInFlight coalesce concurrent scrapes into a single in-flight
+	// fetch: instead of queuing N scrapes behind each other (each taking up to
+	// rpcTimeout), all callers that arrive while a fetch is running simply wait for
+	// that one fetch to finish and reuse its result.
+	fetchMu       sync.Mutex
+	fetchInFlight chan struct{}
+
+	// rpcTransport and rpcClientURL are built once at startup from the (static)
+	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
+	// across scrapes so each scrape doesn't pay a fresh connection handshake.
+	rpcTransport http.RoundTripper
+	rpcClientURL string
 
 	processesMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -98,13 +109,12 @@ func (b *cancelOnCloseBody) Close() error {
 }
 
 // createTransport creates an HTTP transport that supports both HTTP and Unix socket connections.
-// It also returns the base *http.Transport so callers can release its idle connections themselves:
-// once wrapped in timeoutTransport (and possibly authenticatedTransport), kolo/xmlrpc's own
-// best-effort CloseIdleConnections() type-assertion on Client.Close() no longer matches.
-func createTransport(targetURL string) (http.RoundTripper, string, *http.Transport, error) {
+// It is called once at startup; the returned transport is reused across scrapes so repeated
+// scrapes benefit from connection reuse instead of paying a fresh handshake every time.
+func createTransport(targetURL string) (http.RoundTripper, string, error) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("failed to parse URL: %v", err)
+		return nil, "", fmt.Errorf("failed to parse URL: %v", err)
 	}
 
 	var baseTransport *http.Transport
@@ -116,7 +126,7 @@ func createTransport(targetURL string) (http.RoundTripper, string, *http.Transpo
 		// puts the first path segment into Host instead, which would dial the
 		// wrong socket without any error.
 		if parsedURL.Host != "" {
-			return nil, "", nil, fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", targetURL)
+			return nil, "", fmt.Errorf("invalid unix socket URL %q: use unix:///path/to/socket (three slashes)", targetURL)
 		}
 		// For Unix sockets, we need to use a custom transport
 		socketPath := parsedURL.Path
@@ -145,7 +155,7 @@ func createTransport(targetURL string) (http.RoundTripper, string, *http.Transpo
 
 	// Bound the whole request/response cycle so a hung or slow Supervisord
 	// can't block a scrape indefinitely.
-	return &timeoutTransport{Transport: transport, Timeout: rpcTimeout}, clientURL, baseTransport, nil
+	return &timeoutTransport{Transport: transport, Timeout: rpcTimeout}, clientURL, nil
 }
 
 // authenticatedTransport wraps http.RoundTripper to add Basic Authentication
@@ -170,23 +180,32 @@ type processKey struct {
 	group string
 }
 
-func fetchSupervisorProcessInfo() {
-	// Serialize scrapes: Reset() followed by repopulation is not atomic,
-	// so overlapping scrapes could otherwise observe empty/partial metrics.
+// refreshMetrics coalesces concurrent scrapes: Reset() followed by repopulation is not
+// atomic, so serializing scrapes behind a plain mutex would let them queue up one after
+// another, each taking up to rpcTimeout — an unbounded worst case under load. Instead,
+// only one fetch runs at a time; anyone arriving while it's in flight just waits for it
+// and reuses its result, bounding worst-case latency to a single rpcTimeout.
+func refreshMetrics() {
 	fetchMu.Lock()
-	defer fetchMu.Unlock()
-
-	transport, clientURL, baseTransport, err := createTransport(supervisordURL)
-	if err != nil {
-		log.Printf("Error creating transport: %v", err)
-		supervisordUp.Set(0)
-		processesMetric.Reset()
-		supervisorProcessUptime.Reset()
+	if ch := fetchInFlight; ch != nil {
+		fetchMu.Unlock()
+		<-ch
 		return
 	}
-	defer baseTransport.CloseIdleConnections()
+	ch := make(chan struct{})
+	fetchInFlight = ch
+	fetchMu.Unlock()
 
-	client, err := xmlrpc.NewClient(clientURL, transport)
+	fetchSupervisorProcessInfo()
+
+	fetchMu.Lock()
+	fetchInFlight = nil
+	fetchMu.Unlock()
+	close(ch)
+}
+
+func fetchSupervisorProcessInfo() {
+	client, err := xmlrpc.NewClient(rpcClientURL, rpcTransport)
 	if err != nil {
 		log.Printf("Error creating Supervisor XML-RPC client: %v", err)
 		supervisordUp.Set(0)
@@ -242,7 +261,7 @@ func fetchSupervisorProcessInfo() {
 		state, _ := data["statename"].(string)
 		// kolo/xmlrpc decodes XML-RPC <int> values into interface{} as int64, not int.
 		exitStatus, _ := data["exitstatus"].(int64)
-		startTime, _ := data["start"].(int64)
+		startTime, startTimeOk := data["start"].(int64)
 
 		value := 0
 		if state == "RUNNING" {
@@ -253,8 +272,12 @@ func fetchSupervisorProcessInfo() {
 
 		// Calculate uptime and set the supervisor_process_uptime metric
 		if value == 1 {
-			uptime := time.Now().Unix() - startTime
-			supervisorProcessUptime.WithLabelValues(name, group).Set(float64(uptime))
+			if startTimeOk {
+				uptime := time.Now().Unix() - startTime
+				supervisorProcessUptime.WithLabelValues(name, group).Set(float64(uptime))
+			} else {
+				log.Printf("Warning: process %s/%s is RUNNING but has no valid start time; skipping uptime metric", name, group)
+			}
 		}
 	}
 }
@@ -262,7 +285,7 @@ func fetchSupervisorProcessInfo() {
 var promHandler = promhttp.Handler()
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fetchSupervisorProcessInfo()
+	refreshMetrics()
 	promHandler.ServeHTTP(w, r)
 }
 
@@ -284,6 +307,15 @@ func main() {
 	if version {
 		fmt.Printf("Supervisor Exporter v%v\n", appVersion)
 		os.Exit(0)
+	}
+
+	// Built once and reused for every scrape; supervisordURL/username/password/rpcTimeout
+	// are fixed after flag parsing, so there's no reason to rebuild the transport per request.
+	var err error
+	rpcTransport, rpcClientURL, err = createTransport(supervisordURL)
+	if err != nil {
+		fmt.Printf("Error: %s\n", err)
+		os.Exit(1)
 	}
 
 	http.HandleFunc(metricsPath, metricsHandler)

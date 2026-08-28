@@ -146,10 +146,11 @@ SUPERVISORD_USERNAME="dummy" SUPERVISORD_PASSWORD="dummy" ./supervisord_exporter
 
 ### Prometheus Metrics
 
-The Supervisord Exporter exposes the following Prometheus metric:
+The Supervisord Exporter exposes the following Prometheus metrics:
 
-* `supervisor_process_info`: Gauge vector with labels for `name`, `group`, `state`, `start`, and `exit_status`. The `state` label will be `RUNNING` if the process is running, and `exit_status` will be `0` for a running process.
-* `supervisord_up`: Gauge metric indicating the status of the connection to Supervisord (1 if up, 0 if down). If the Supervisord XML-RPC endpoint is unreachable, this metric will be set to 0, and there will be no supervisor_process_info metrics in the output.
+* `supervisor_process_info`: Gauge vector with labels for `name`, `group`, `state`, and `exit_status`. Value is `1` if the process is running (`state="RUNNING"`) and `0` otherwise. `exit_status` is `0` for a running process, and the process's actual exit code otherwise.
+* `supervisor_process_uptime`: Gauge vector with labels `name` and `group`, giving the uptime in seconds of a running process. Only exported for processes currently in the `RUNNING` state.
+* `supervisord_up`: Gauge metric indicating the status of the connection to Supervisord (1 if up, 0 if down). If the Supervisord XML-RPC endpoint is unreachable, this metric will be set to 0, and there will be no supervisor_process_info/supervisor_process_uptime metrics in the output.
 
 
 Sample metric:
