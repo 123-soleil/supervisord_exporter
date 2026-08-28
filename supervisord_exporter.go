@@ -29,7 +29,7 @@ var (
 	rpcTimeout       time.Duration
 	staleGracePeriod time.Duration
 	version          bool
-	appVersion       = "0.3"
+	appVersion       = "0.4"
 
 	// rpcTransport and rpcClientURL are built once at startup from the (static)
 	// -supervisord-url/-username/-password/-supervisord-timeout flags and reused
