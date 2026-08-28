@@ -87,7 +87,7 @@ Once you have configured and verified the XML-RPC endpoint on Supervisord, you c
 
 ### Installation
 
-Requires Go 1.24 or newer (matching the `go`/`toolchain` directives in `go.mod`). With an older Go installed and no network access for Go's automatic toolchain download, `go build` will fail.
+Requires Go 1.25 or newer (matching the `go` directive in `go.mod`). With an older Go installed and no network access for Go's automatic toolchain download, `go build` will fail.
 
 1. Clone the repository:
 
