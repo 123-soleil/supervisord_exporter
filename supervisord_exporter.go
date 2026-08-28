@@ -92,9 +92,14 @@ type processSample struct {
 
 // snapshot is the full, self-consistent set of data for one scrape.
 type snapshot struct {
-	up              float64
-	processes       []processSample
-	lastSuccessUnix int64 // 0 if there has never been a successful fetch
+	up        float64
+	processes []processSample
+	// lastSuccess is zero until the first successful fetch. It's compared with
+	// time.Since (not a stored Unix timestamp) so the grace-period countdown rides
+	// on the monotonic clock reading time.Now() attaches, immune to wall-clock
+	// steps (NTP correction, VM suspend/resume) — only the exported metric below
+	// converts it to a wall-clock Unix timestamp, for external consumers.
+	lastSuccess time.Time
 }
 
 func init() {
@@ -104,7 +109,7 @@ func init() {
 	flag.StringVar(&username, "username", "", "Username for Supervisord authentication (prefer SUPERVISORD_USERNAME env var)")
 	flag.StringVar(&password, "password", "", "Password for Supervisord authentication (prefer SUPERVISORD_PASSWORD env var to avoid leaking it via process listings)")
 	flag.DurationVar(&rpcTimeout, "supervisord-timeout", 10*time.Second, "Timeout for XML-RPC requests to Supervisord")
-	flag.DurationVar(&staleGracePeriod, "stale-grace-period", time.Minute, "How long to keep serving the last known process metrics (with supervisord_up=0) after Supervisord becomes unreachable, before clearing them as too stale to trust")
+	flag.DurationVar(&staleGracePeriod, "stale-grace-period", time.Minute, "How long to keep serving the last known process metrics (with supervisord_up=0) after Supervisord becomes unreachable, before clearing them as too stale to trust. It's only re-evaluated on each scrape, so set it well above your Prometheus scrape_interval or it won't tolerate even one hiccup; 0 disables the grace period entirely")
 	flag.BoolVar(&version, "version", false, "Displays application version")
 
 	currentSnapshot.Store(&snapshot{})
@@ -128,8 +133,8 @@ func (supervisorCollector) Collect(ch chan<- prometheus.Metric) {
 	snap := currentSnapshot.Load()
 
 	ch <- prometheus.MustNewConstMetric(supervisordUpDesc, prometheus.GaugeValue, snap.up)
-	if snap.lastSuccessUnix != 0 {
-		ch <- prometheus.MustNewConstMetric(lastSuccessDesc, prometheus.GaugeValue, float64(snap.lastSuccessUnix))
+	if !snap.lastSuccess.IsZero() {
+		ch <- prometheus.MustNewConstMetric(lastSuccessDesc, prometheus.GaugeValue, float64(snap.lastSuccess.Unix()))
 	}
 
 	for _, p := range snap.processes {
@@ -159,10 +164,11 @@ func publishSnapshot(snap *snapshot) {
 func markDown() {
 	prev := currentSnapshot.Load()
 	processes := prev.processes
-	if prev.lastSuccessUnix != 0 && time.Since(time.Unix(prev.lastSuccessUnix, 0)) > staleGracePeriod {
+	if !prev.lastSuccess.IsZero() && time.Since(prev.lastSuccess) > staleGracePeriod {
+		log.Printf("Warning: no successful Supervisord scrape in over %s (stale-grace-period); clearing previously reported process metrics", staleGracePeriod)
 		processes = nil
 	}
-	currentSnapshot.Store(&snapshot{up: 0, processes: processes, lastSuccessUnix: prev.lastSuccessUnix})
+	currentSnapshot.Store(&snapshot{up: 0, processes: processes, lastSuccess: prev.lastSuccess})
 }
 
 // timeoutTransport bounds the total time spent reading a request's headers and body,
@@ -361,7 +367,7 @@ func fetchSupervisorProcessInfo() {
 		processes = append(processes, sample)
 	}
 
-	publishSnapshot(&snapshot{up: 1, processes: processes, lastSuccessUnix: time.Now().Unix()})
+	publishSnapshot(&snapshot{up: 1, processes: processes, lastSuccess: time.Now()})
 }
 
 var promHandler = promhttp.Handler()
@@ -373,6 +379,10 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	flag.Parse()
+
+	if staleGracePeriod < 0 {
+		log.Fatalf("Error: -stale-grace-period must be >= 0, got %s", staleGracePeriod)
+	}
 
 	// Prefer environment variables for credentials over CLI flags, which are
 	// visible to other local users via the process list (e.g. `ps aux`).

@@ -118,7 +118,7 @@ The Supervisord Exporter can be configured using command line parameters. Here a
 * `-username`: Username for Supervisord authentication (optional). Prefer the `SUPERVISORD_USERNAME` environment variable, since CLI flags are visible to other local users via the process list.
 * `-password`: Password for Supervisord authentication (optional). Prefer the `SUPERVISORD_PASSWORD` environment variable, since CLI flags are visible to other local users via the process list.
 * `-supervisord-timeout`: Timeout for XML-RPC requests to Supervisord. Default is `10s`
-* `-stale-grace-period`: How long to keep serving the last known process metrics (with `supervisord_up=0`) after Supervisord becomes unreachable, before clearing them as too stale to trust. Default is `1m`
+* `-stale-grace-period`: How long to keep serving the last known process metrics (with `supervisord_up=0`) after Supervisord becomes unreachable, before clearing them as too stale to trust. Default is `1m`. This is only re-evaluated on each scrape, so set it well above your Prometheus `scrape_interval` — if it's shorter than (or close to) `scrape_interval`, the very first failed scrape may already exceed it and clear the metrics immediately, defeating the point. Set to `0` to disable the grace period (clear immediately on any failure).
 * `-web.listen-address`: The address and port where the exporter will listen for HTTP requests. Default is `:9876`
 * `-web.telemetry-path`: Path under which to expose metrics. Default is `/metrics`
 * `-version`: Print the version information and exit.
